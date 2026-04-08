@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Accesstive — iOS Accessibility Testing</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header>
+        <div class="header-content">
+            <h1>♿ Accesstive</h1>
+            <p class="subtitle">iOS Accessibility Testing Dashboard</p>
+        </div>
+        <div class="device-bar">
+            <label for="deviceSelect">Device:</label>
+            <select id="deviceSelect">
+                <option value="">Loading devices…</option>
+            </select>
+            <button id="refreshDevices" class="btn btn-sm" title="Refresh devices">↻</button>
+            <span id="deviceStatus" class="status-badge"></span>
+        </div>
+    </header>
+
+    <nav class="tabs">
+        <button class="tab active" data-tab="inspect">🔍 Inspect</button>
+        <button class="tab" data-tab="audit">📋 Audit</button>
+        <button class="tab" data-tab="navigate">🎮 Navigate</button>
+        <button class="tab" data-tab="watch">👁 Watch</button>
+    </nav>
+
+    <main>
+        <!-- ===== INSPECT TAB ===== -->
+        <section id="tab-inspect" class="tab-content active">
+            <div class="panel-header">
+                <h2>Accessibility Tree</h2>
+                <div class="controls">
+                    <input type="text" id="inspectBundleId" placeholder="Bundle ID (optional)">
+                    <input type="number" id="inspectMaxDepth" placeholder="Max depth" min="1" max="50">
+                    <button id="runInspect" class="btn btn-primary">Inspect</button>
+                </div>
+            </div>
+            <div id="inspectLoading" class="loading hidden">Capturing accessibility tree…</div>
+            <div id="inspectError" class="error hidden"></div>
+            <div id="inspectResult" class="result">
+                <p class="placeholder">Select a device and click Inspect to capture the accessibility tree.</p>
+            </div>
+            <div id="inspectStats" class="stats hidden"></div>
+        </section>
+
+        <!-- ===== AUDIT TAB ===== -->
+        <section id="tab-audit" class="tab-content">
+            <div class="panel-header">
+                <h2>Accessibility Audit</h2>
+                <div class="controls">
+                    <input type="text" id="auditBundleId" placeholder="Bundle ID (optional)">
+                    <select id="auditSeverity">
+                        <option value="">All severities</option>
+                        <option value="hint">Hint+</option>
+                        <option value="warning">Warning+</option>
+                        <option value="error">Error only</option>
+                    </select>
+                    <button id="runAudit" class="btn btn-primary">Run Audit</button>
+                </div>
+            </div>
+            <div id="auditLoading" class="loading hidden">Running audit rules…</div>
+            <div id="auditError" class="error hidden"></div>
+            <div id="auditResult" class="result">
+                <p class="placeholder">Select a device and click Run Audit to check for accessibility issues.</p>
+            </div>
+            <div id="auditSummary" class="stats hidden"></div>
+        </section>
+
+        <!-- ===== NAVIGATE TAB ===== -->
+        <section id="tab-navigate" class="tab-content">
+            <div class="panel-header">
+                <h2>Interactive Navigator</h2>
+                <div class="controls">
+                    <button id="navConnect" class="btn btn-primary">Connect</button>
+                    <button id="navDisconnect" class="btn btn-danger hidden">Disconnect</button>
+                </div>
+            </div>
+            <div id="navStatus" class="nav-status hidden"></div>
+            <div id="navControls" class="nav-controls hidden">
+                <div class="nav-current" id="navCurrent">
+                    <span class="nav-label">No element focused</span>
+                </div>
+                <div class="nav-buttons">
+                    <button class="btn nav-btn" data-action="first" title="First element">⏮ First</button>
+                    <button class="btn nav-btn" data-action="previous" title="Previous element">◀ Prev</button>
+                    <button class="btn nav-btn btn-activate" data-action="activate" title="Tap / activate">⏺
+                        Activate</button>
+                    <button class="btn nav-btn" data-action="next" title="Next element">Next ▶</button>
+                    <button class="btn nav-btn" data-action="last" title="Last element">Last ⏭</button>
+                </div>
+                <div class="nav-extras">
+                    <button class="btn btn-sm" id="navListElements">📋 List All Elements</button>
+                </div>
+            </div>
+            <div id="navElementList" class="result hidden"></div>
+            <div id="navLog" class="nav-log hidden">
+                <h3>Navigation Log</h3>
+                <div id="navLogEntries"></div>
+            </div>
+        </section>
+
+        <!-- ===== WATCH TAB ===== -->
+        <section id="tab-watch" class="tab-content">
+            <div class="panel-header">
+                <h2>Live Watch</h2>
+                <div class="controls">
+                    <label>Interval:
+                        <input type="number" id="watchInterval" value="3" min="1" max="30" style="width:60px"> s
+                    </label>
+                    <button id="watchStart" class="btn btn-primary">Start Watching</button>
+                    <button id="watchStop" class="btn btn-danger hidden">Stop</button>
+                </div>
+            </div>
+            <div id="watchOutput" class="result watch-output">
+                <p class="placeholder">Start watching to monitor accessibility changes in real time.</p>
+            </div>
+        </section>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

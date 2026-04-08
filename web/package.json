@@ -1,0 +1,17 @@
+{
+  "name": "accesstive-web",
+  "version": "1.0.0",
+  "description": "Web UI for Accesstive iOS accessibility testing tool",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1",
+    "ws": "^8.20.0"
+  }
+}

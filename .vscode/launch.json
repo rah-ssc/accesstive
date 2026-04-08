@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:accesstive}",
+            "name": "Debug accesstive",
+            "target": "accesstive",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug accesstive"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:accesstive}",
+            "name": "Release accesstive",
+            "target": "accesstive",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release accesstive"
+        }
+    ]
+}
