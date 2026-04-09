@@ -19,6 +19,7 @@ Commands:
 
 import asyncio
 import json
+import subprocess
 import sys
 
 from pymobiledevice3.lockdown import create_using_usbmux
@@ -33,13 +34,148 @@ class AccessibilityBridge:
     def __init__(self):
         self.service = None
         self.lockdown = None
+        self.udid = None
         self.current_element = None
         self.current_element_bytes = None
+        self.current_actions = []
         self._monitoring_ready = False
+
+    def _activation_help_hint(self):
+        """Return platform-specific guidance for activation fallbacks."""
+        product_version = getattr(self.lockdown, "product_version", "") or ""
+        major = 0
+        try:
+            major = int(str(product_version).split(".", 1)[0])
+        except Exception:
+            major = 0
+
+        if major >= 17:
+            return (
+                "For iOS 17+, start a tunnel in another terminal: "
+                "sudo pymobiledevice3 remote start-tunnel --udid "
+                f"{self.udid} --script-mode"
+            )
+
+        return (
+            "For iOS 16 and below, mount DeveloperDiskImage first (WDA needs it): "
+            "sudo pymobiledevice3 mounter auto-mount --udid "
+            f"{self.udid}"
+        )
+
+    @staticmethod
+    def _wrap_passthrough(value):
+        return {"ObjectType": "passthrough", "Value": value}
+
+    def _extract_actions(self, focus_item):
+        """Extract available action attributes from the focused element metadata."""
+        actions = []
+        fields = getattr(focus_item, "_fields", {}) if focus_item is not None else {}
+        sections = fields.get("InspectorSectionsValue_v1") or []
+
+        for section in sections:
+            section_fields = getattr(section, "_fields", {})
+            section_id = section_fields.get("IdentifierValue_v1")
+            section_title = section_fields.get("TitleValue_v1")
+            if section_id != "iOS_Actions_v1" and section_title != "Actions":
+                continue
+
+            for attr in section_fields.get("ElementAttributesValue_v1") or []:
+                attr_fields = getattr(attr, "_fields", {})
+                if not attr_fields:
+                    continue
+                actions.append(attr_fields)
+
+        return actions
+
+    def _build_action_payload(self, action_fields):
+        """Build DTX payload for a specific AX action attribute."""
+        return {
+            "ObjectType": "AXAuditElementAttribute_v1",
+            "Value": {
+                "ObjectType": "passthrough",
+                "Value": {
+                    key: self._wrap_passthrough(value)
+                    for key, value in action_fields.items()
+                },
+            },
+        }
+
+    def _run_wda_tap(self, selector, using):
+        """Try WDA tap by selector. Returns None on success or error text on failure."""
+        if not self.udid:
+            return "No device UDID available for WDA tap"
+
+        cmd = [
+            "pymobiledevice3",
+            "developer",
+            "wda",
+            "tap",
+            "--udid",
+            self.udid,
+            "--using",
+            using,
+            "--timeout",
+            "6",
+            selector,
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=12,
+                check=False,
+            )
+        except Exception as e:
+            return str(e)
+
+        stderr_text = (result.stderr or "").strip()
+        stdout_text = (result.stdout or "").strip()
+        combined = f"{stdout_text}\n{stderr_text}".strip().lower()
+
+        # pymobiledevice3 wda commands may emit an error on stderr with return code 0.
+        if result.returncode == 0 and "error" not in combined and "failed" not in combined:
+            return None
+
+        return (stderr_text or stdout_text or "WDA tap failed").strip()
+
+    def _attempt_wda_tap_fallback(self):
+        """Fallback tap using WebDriverAgent selectors based on focused caption."""
+        caption = (getattr(self.current_element, "caption", None) or "").strip()
+        if not caption:
+            return False, "No focused caption available for WDA tap fallback"
+
+        candidates = [caption]
+        primary = caption.split(",", 1)[0].strip()
+        if primary and primary not in candidates:
+            candidates.append(primary)
+
+        strategies = ["name", "label", "accessibility id"]
+        errors = []
+
+        for sel in candidates:
+            for using in strategies:
+                err = self._run_wda_tap(sel, using)
+                if err is None:
+                    return True, f"WDA tap succeeded via {using}: {sel}"
+                errors.append(f"{using}:{sel}: {err}")
+
+        return False, (errors[-1] if errors else "Unknown WDA error")
+
+    def _cache_focus_item(self, current_item):
+        """Store the latest focused item and its element identifier bytes."""
+        self.current_element = current_item
+        element_obj = getattr(current_item, "element", None)
+        self.current_element_bytes = (
+            element_obj.identifier if element_obj is not None else None
+        )
+        self.current_actions = self._extract_actions(current_item)
 
     async def connect(self, udid):
         self.lockdown = await create_using_usbmux(serial=udid)
         self.service = AccessibilityAudit(self.lockdown)
+        self.udid = udid
         # Enable event monitoring so we can read focused element after move_focus
         await self.service._ensure_ready()
         await self.service.set_app_monitoring_enabled(True)
@@ -100,12 +236,40 @@ class AccessibilityBridge:
                 else:
                     current_item = event.data
 
-                self.current_element = current_item
-                element_obj = getattr(current_item, "element", None)
-                self.current_element_bytes = element_obj.identifier if element_obj is not None else None
+                self._cache_focus_item(current_item)
                 return self._format_element(current_item)
         except Exception as e:
             return {"error": str(e)}
+
+    async def _sync_latest_focus_event(self, timeout=0.2):
+        """Drain pending events briefly and cache the latest focused element if present."""
+        if not self.service:
+            return
+
+        while True:
+            try:
+                name, args = await asyncio.wait_for(self.service._event_queue.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return
+
+            payload = self.service._extract_event_payload(args)
+            if payload is None:
+                continue
+
+            from pymobiledevice3.services.accessibilityaudit import Event
+
+            event = Event(name=name, data=deserialize_object(payload))
+            if event.name != "hostInspectorCurrentElementChanged:":
+                continue
+
+            if isinstance(event.data, list):
+                if not event.data:
+                    continue
+                current_item = event.data[0]
+            else:
+                current_item = event.data
+
+            self._cache_focus_item(current_item)
 
     def _format_element(self, element):
         """Convert an AXAuditInspectorFocus_v1 to a JSON-serializable dict."""
@@ -122,12 +286,95 @@ class AccessibilityBridge:
         """Press/activate the current element."""
         if not self.service:
             return {"error": "Not connected"}
-        if self.current_element_bytes is None:
-            return {"error": "No element focused. Use next/previous/first first."}
 
         try:
+            # If user changed focus on-device (outside nav commands), sync latest event first.
+            await self._sync_latest_focus_event()
+
+            # If we still do not have a focused element, acquire one explicitly.
+            if self.current_element_bytes is None:
+                await self.service.move_focus(Direction.Next)
+                focused = await self._read_focused_element()
+                if focused.get("error"):
+                    return focused
+
+            if self.current_element_bytes is None:
+                return {"error": "No element focused. Use next/previous/first first."}
+
             element_ref = self.current_element_bytes
-            await self.service.perform_press(element_ref)
+
+            # Prefer the focused element's declared Activate action if present.
+            activate_action = None
+            for action in self.current_actions:
+                name = action.get("HumanReadableNameValue_v1")
+                attr = action.get("AttributeNameValue_v1")
+                performs = action.get("PerformsActionValue_v1")
+                if name == "Activate" or attr == "AXAction-2010":
+                    if performs is False:
+                        continue
+                    activate_action = action
+                    break
+
+            if activate_action is not None:
+                element_payload = {
+                    "ObjectType": "AXAuditElement_v1",
+                    "Value": {
+                        "ObjectType": "passthrough",
+                        "Value": {
+                            "PlatformElementValue_v1": {"ObjectType": "passthrough"},
+                            "Value": element_ref,
+                        },
+                    },
+                }
+                action_payload = self._build_action_payload(activate_action)
+                await self.service._invoke(
+                    "deviceElement:performAction:withValue:",
+                    element_payload,
+                    action_payload,
+                    0,
+                    expects_reply=False,
+                )
+            else:
+                # Fallback for elements that do not expose action metadata.
+                await self.service.perform_press(element_ref)
+
+            # Detect whether the action had a visible effect. Some apps (especially
+            # system apps / non-debuggable targets) acknowledge the call but ignore it.
+            before_caption = getattr(self.current_element, "caption", None)
+            await self._sync_latest_focus_event(timeout=0.7)
+            after_caption = getattr(self.current_element, "caption", None)
+
+            if before_caption == after_caption:
+                wda_ok, wda_info = self._attempt_wda_tap_fallback()
+                if wda_ok:
+                    # Confirm a visible focus/UI update after WDA fallback tap.
+                    await self._sync_latest_focus_event(timeout=1.5)
+                    after_wda_caption = getattr(self.current_element, "caption", None)
+                    if after_wda_caption != before_caption:
+                        return {
+                            "ok": True,
+                            "action": "activate",
+                            "note": "AX activate had no UI change; WDA tap fallback succeeded.",
+                        }
+
+                    return {
+                        "ok": False,
+                        "warning": (
+                            "WDA tap command succeeded, but no focus/UI change was detected. "
+                            "The element may be non-activatable or a control that does not change focus."
+                        ),
+                    }
+
+                platform_hint = self._activation_help_hint()
+                return {
+                    "ok": False,
+                    "warning": (
+                        "Activate was sent, but no UI change was detected. "
+                        "This can happen on system or non-debuggable apps. "
+                        f"WDA fallback also failed ({wda_info}). {platform_hint}"
+                    ),
+                }
+
             return {"ok": True, "action": "activate"}
         except Exception as e:
             return {"error": f"Activate failed: {e}"}
@@ -153,6 +400,7 @@ class AccessibilityBridge:
                 pass
             self.service = None
         self.lockdown = None
+        self.udid = None
         return {"ok": True}
 
 

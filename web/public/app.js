@@ -427,6 +427,11 @@ function handleNavResponse(data) {
         navLog(`Listed ${data.count} elements`);
     } else if (data.ok && data.action === 'activate') {
         navLog('← Activated ✓');
+        if (data.note) {
+            navLog(`Info: ${data.note}`);
+        }
+    } else if (data.warning) {
+        navLog(`Warning: ${data.warning}`);
     } else if (data.error) {
         navLog(`Error: ${data.error}`);
     }
