@@ -2,6 +2,8 @@
 let selectedDevice = '';
 let ws = null;
 let navConnected = false;
+const focusLogEvents = [];
+const MAX_FOCUS_EVENTS = 200;
 
 // ---------- DOM ----------
 const $ = (sel) => document.querySelector(sel);
@@ -15,7 +17,9 @@ document.addEventListener('DOMContentLoaded', () => {
     setupAudit();
     setupNavigate();
     setupWatch();
+    setupFocusLogs();
     setupKeyboardNav();
+    connectWebSocket();
 
     $('#refreshDevices').addEventListener('click', loadDevices);
     $('#deviceSelect').addEventListener('change', (e) => {
@@ -314,7 +318,10 @@ function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${protocol}//${location.host}`);
 
-    ws.addEventListener('open', () => console.log('WebSocket connected'));
+    ws.addEventListener('open', () => {
+        console.log('WebSocket connected');
+        ws.send(JSON.stringify({ type: 'focus:get' }));
+    });
     ws.addEventListener('close', () => {
         console.log('WebSocket disconnected');
         if (navConnected) {
@@ -354,6 +361,15 @@ function handleWsMessage(msg) {
             break;
         case 'watch:stopped':
             watchStopped();
+            break;
+        case 'focus:event':
+            appendFocusEvent(msg.event);
+            break;
+        case 'focus:history':
+            setFocusHistory(msg.events || []);
+            break;
+        case 'focus:cleared':
+            setFocusHistory([]);
             break;
     }
 }
@@ -527,6 +543,122 @@ function appendWatchData(text) {
     }
     output.textContent += text;
     output.scrollTop = output.scrollHeight;
+}
+
+// ---------- Focus Logs ----------
+function setupFocusLogs() {
+    $('#focusLogDownload').addEventListener('click', downloadFocusLogs);
+    $('#focusLogClear').addEventListener('click', clearFocusLogs);
+    updateFocusLogCount();
+}
+
+function downloadFocusLogs() {
+    const payload = JSON.stringify(focusLogEvents, null, 2);
+    const blob = new Blob([payload], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+
+    link.href = url;
+    link.download = `focus-logs-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+}
+
+function clearFocusLogs() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'focus:clear' }));
+    }
+    setFocusHistory([]);
+}
+
+function setFocusHistory(events) {
+    focusLogEvents.length = 0;
+    const safeEvents = Array.isArray(events) ? events.slice(-MAX_FOCUS_EVENTS) : [];
+    safeEvents.forEach((event) => focusLogEvents.push(event));
+
+    const output = $('#focusLogs');
+    output.innerHTML = '';
+    if (focusLogEvents.length === 0) {
+        output.innerHTML = '<p class="placeholder">Focus events will appear here when navigating elements.</p>';
+        updateFocusLogCount();
+        return;
+    }
+
+    focusLogEvents.forEach((event) => {
+        output.appendChild(buildFocusLogEntry(event));
+    });
+    output.scrollTop = output.scrollHeight;
+    updateFocusLogCount();
+}
+
+function appendFocusEvent(event) {
+    if (!event || typeof event !== 'object') return;
+
+    const output = $('#focusLogs');
+    const shouldAutoScroll = output.scrollTop + output.clientHeight >= output.scrollHeight - 20;
+
+    if (output.querySelector('.placeholder')) {
+        output.innerHTML = '';
+    }
+
+    focusLogEvents.push(event);
+    while (focusLogEvents.length > MAX_FOCUS_EVENTS) {
+        focusLogEvents.shift();
+        if (output.firstChild) {
+            output.removeChild(output.firstChild);
+        }
+    }
+
+    output.appendChild(buildFocusLogEntry(event));
+    if (shouldAutoScroll) {
+        output.scrollTop = output.scrollHeight;
+    }
+
+    updateFocusLogCount();
+}
+
+function buildFocusLogEntry(event) {
+    const row = document.createElement('div');
+    row.className = 'focus-log-entry';
+
+    const timestamp = formatFocusTimestamp(event.timestamp);
+    const label = event.label || '(unlabeled)';
+    const traits = Array.isArray(event.traits) && event.traits.length > 0
+        ? event.traits.join(', ')
+        : 'none';
+    const bounds = formatFocusBounds(event.bounds);
+
+    row.innerHTML = `
+    <div class="focus-log-top">
+      <span class="timestamp">${escapeHtml(timestamp)}</span>
+      <span class="focus-log-label">${escapeHtml(label)}</span>
+    </div>
+    <div class="focus-log-meta">traits: ${escapeHtml(traits)} • bounds: ${escapeHtml(bounds)}</div>`;
+
+    return row;
+}
+
+function formatFocusTimestamp(value) {
+    if (!value) return new Date().toISOString();
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return String(value);
+    return parsed.toLocaleTimeString();
+}
+
+function formatFocusBounds(bounds) {
+    if (!bounds || typeof bounds !== 'object') return 'n/a';
+    const x = Number(bounds.x);
+    const y = Number(bounds.y);
+    const width = Number(bounds.width);
+    const height = Number(bounds.height);
+    if ([x, y, width, height].some((n) => Number.isNaN(n))) return 'n/a';
+    return `${x.toFixed(1)}, ${y.toFixed(1)}, ${width.toFixed(1)}x${height.toFixed(1)}`;
+}
+
+function updateFocusLogCount() {
+    $('#focusLogCount').textContent = `${focusLogEvents.length} event${focusLogEvents.length === 1 ? '' : 's'}`;
 }
 
 // ---------- Helpers ----------

@@ -9,8 +9,22 @@ struct Navigate: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Target device UDID.")
     var device: String
 
+    @Flag(name: .long, help: "Emit structured focus-event JSON lines as navigation changes focus.")
+    var emitFocusEvents: Bool = false
+
     func run() async throws {
-        let bridge = try BridgeProcess(udid: device)
+        let bridge = try BridgeProcess(
+            udid: device,
+            onFocusEvent: emitFocusEvents ? { event in
+                guard JSONSerialization.isValidJSONObject(event),
+                    let data = try? JSONSerialization.data(withJSONObject: event),
+                    let text = String(data: data, encoding: .utf8)
+                else {
+                    return
+                }
+                print(text)
+            } : nil
+        )
         defer { bridge.stop() }
 
         try bridge.start()
@@ -133,21 +147,24 @@ struct Navigate: AsyncParsableCommand {
 /// Manages the Python bridge subprocess for pymobiledevice3 communication.
 private final class BridgeProcess {
     let udid: String
+    private let onFocusEvent: (([String: Any]) -> Void)?
     private var process: Process?
     private var stdinPipe: Pipe?
     private var stdoutPipe: Pipe?
 
-    init(udid: String) throws {
+    init(udid: String, onFocusEvent: (([String: Any]) -> Void)? = nil) throws {
         self.udid = udid
+        self.onFocusEvent = onFocusEvent
     }
 
     func start() throws {
         let process = Process()
         let stdin = Pipe()
         let stdout = Pipe()
+        let pythonBin = ProcessInfo.processInfo.environment["ACCESSTIVE_PYTHON"] ?? "python3.11"
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", bridgeScriptPath()]
+        process.arguments = [pythonBin, bridgeScriptPath()]
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = FileHandle.nullDevice
@@ -177,13 +194,23 @@ private final class BridgeProcess {
 
         stdinPipe?.fileHandleForWriting.write(text.data(using: .utf8)!)
 
-        let responseLine = try readLine()
-        guard let responseData = responseLine.data(using: .utf8),
-            let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any]
-        else {
-            throw AccesstiveError.connectionFailed("Invalid response from bridge")
+        while true {
+            let responseLine = try readLine()
+            guard let responseData = responseLine.data(using: .utf8),
+                let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any]
+            else {
+                throw AccesstiveError.connectionFailed("Invalid response from bridge")
+            }
+
+            // Focus events are streamed as out-of-band messages; emit and continue
+            // reading until we receive the command response.
+            if json["type"] as? String == "focus:event" {
+                onFocusEvent?(json)
+                continue
+            }
+
+            return json
         }
-        return json
     }
 
     private func readLine() throws -> String {

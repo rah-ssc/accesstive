@@ -17,6 +17,7 @@ An iOS accessibility testing toolkit — **CLI + Web Dashboard** — powered by 
     - [Step 4 — Grant Accessibility Permissions](#step-4--grant-accessibility-permissions)
     - [Step 5 — Set Up the Web Dashboard (Optional)](#step-5--set-up-the-web-dashboard-optional)
     - [Step 6 — Verify the Installation](#step-6--verify-the-installation)
+    - [Step 7 — Run the CLI and Web Dashboard](#step-7--run-the-cli-and-web-dashboard)
   - [CLI Usage](#cli-usage)
     - [List Devices](#list-devices)
     - [Inspect Accessibility Tree](#inspect-accessibility-tree)
@@ -28,6 +29,7 @@ An iOS accessibility testing toolkit — **CLI + Web Dashboard** — powered by 
     - [Dashboard Tabs](#dashboard-tabs)
     - [REST API](#rest-api)
     - [WebSocket Events](#websocket-events)
+  - [Focus Logs Test Flow](#focus-logs-test-flow)
   - [Built-in Audit Rules](#built-in-audit-rules)
   - [Architecture](#architecture)
   - [How It Works](#how-it-works)
@@ -49,6 +51,7 @@ An iOS accessibility testing toolkit — **CLI + Web Dashboard** — powered by 
 | **Watch**    |   ✅   |   ✅   | Live-monitor accessibility changes with diff output     |
 | **Navigate** |   ✅   |   ✅   | Interactively move through elements on physical devices |
 | **Activate** |   ✅   |   ✅   | Tap/press the currently focused element                 |
+| **Focus Logs** | ✅ | ✅ | Stream timestamped focus changes (label/traits/bounds) |
 | **CI-Ready** |   ✅   |   —   | JUnit XML output and `--strict` exit codes              |
 
 ---
@@ -162,6 +165,27 @@ C29D477A-8788-42F3-B906-83CF523BCC11         iPhone 17 Pro                Booted
 1c6af738c65775d212845c98b9e78a8e96c89e87     iPhone X                     Connected
 ```
 
+### Step 7 — Run the CLI and Web Dashboard
+
+From the project root, keep the CLI build available and start the web server:
+
+```bash
+# Build the Swift CLI in debug mode if needed
+swift build
+
+# Start the dashboard on http://localhost:3000
+npm --prefix web start
+```
+
+If you prefer to run from inside the `web/` directory directly:
+
+```bash
+cd web
+npm start
+```
+
+Open [http://localhost:3000](http://localhost:3000) in your browser. The dashboard uses the debug CLI binary at `.build/debug/accesstive` and the Python bridge at `Scripts/accesstive-bridge.py`.
+
 ---
 
 ## CLI Usage
@@ -228,6 +252,9 @@ accesstive audit --strict
 ```bash
 # Start interactive navigation on a USB-connected device
 accesstive navigate --device <UDID>
+
+# Emit structured focus events as JSON lines during navigation
+accesstive navigate --device <UDID> --emit-focus-events
 ```
 
 Once connected, use these commands in the interactive prompt:
@@ -281,6 +308,7 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 | **Audit**    | Run accessibility audit rules and see results as severity-coded cards (error / warning / hint)                 |
 | **Navigate** | Connect to a physical device and navigate elements interactively using on-screen buttons or keyboard shortcuts |
 | **Watch**    | Start real-time monitoring and see accessibility tree changes streamed live                                    |
+| **Focus Logs** | Live stream of focus events (timestamp, label, traits, bounds) with rolling 200-event history             |
 
 **Keyboard shortcuts in Navigate tab:**
 
@@ -313,6 +341,8 @@ Connect to `ws://localhost:3000` for real-time features:
 | `navigate:disconnect` | —                         | End navigation session                 |
 | `watch:start`         | `{ device?, interval? }`  | Start live monitoring                  |
 | `watch:stop`          | —                         | Stop monitoring                        |
+| `focus:get`           | —                         | Request current rolling focus history  |
+| `focus:clear`         | —                         | Clear rolling focus history            |
 
 **Server → Client:**
 
@@ -323,6 +353,34 @@ Connect to `ws://localhost:3000` for real-time features:
 | `navigate:disconnected` | `{ code }`  | Bridge process exited         |
 | `watch:data`            | `{ data }`  | Streaming tree output         |
 | `watch:stopped`         | —           | Watch process ended           |
+| `focus:history`         | `{ events }`| Last 200 focus events         |
+| `focus:event`           | `{ event }` | One streamed focus event      |
+| `focus:cleared`         | —           | Focus history was cleared     |
+
+---
+
+## Focus Logs Test Flow
+
+The focus log pipeline can be validated with a booted simulator (or a connected physical device):
+
+```bash
+# 1) Build CLI
+swift build
+
+# 2) Start dashboard server (terminal A)
+npm --prefix web start
+
+# 3) Run websocket focus-log smoke test (terminal B)
+# Defaults to ws://localhost:3000 and device=booted
+npm --prefix web run test:focus-logs
+```
+
+The test will:
+
+1. Connect through the existing navigate bridge.
+2. Trigger `first` and `next` navigation actions.
+3. Assert that `focus:event` JSON is emitted by the bridge.
+4. Assert events are received by the frontend websocket path in the same order.
 
 ---
 

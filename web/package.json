@@ -4,7 +4,8 @@
   "description": "Web UI for Accesstive iOS accessibility testing tool",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test:focus-logs": "node scripts/focus-logs-test.js"
   },
   "keywords": [],
   "author": "",

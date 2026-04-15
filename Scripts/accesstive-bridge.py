@@ -21,6 +21,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.services.accessibilityaudit import (
@@ -39,6 +40,10 @@ class AccessibilityBridge:
         self.current_element_bytes = None
         self.current_actions = []
         self._monitoring_ready = False
+        self.wda_xctrunner_candidates = [
+            "com.facebook.WebDriverAgentRunner.xctrunner",
+            "com.pcloudywda.WebDriverAgentRunner.xctrunner",
+        ]
 
     def _activation_help_hint(self):
         """Return platform-specific guidance for activation fallbacks."""
@@ -100,12 +105,43 @@ class AccessibilityBridge:
             },
         }
 
-    def _run_wda_tap(self, selector, using):
+    def _compact_wda_error(self, raw_error):
+        """Reduce noisy WDA stderr output to a short, user-facing summary."""
+        text = (raw_error or "").strip()
+        if not text:
+            return "WDA tap failed"
+
+        lowered = text.lower()
+
+        if "appnotinstallederror" in lowered:
+            if "com.facebook.webdriveragentrunner.xctrunner" in lowered:
+                return "WDA runner not installed (com.facebook.WebDriverAgentRunner.xctrunner)"
+            if "com.pcloudywda.webdriveragentrunner.xctrunner" in lowered:
+                return "WDA runner not installed (com.pcloudywda.WebDriverAgentRunner.xctrunner)"
+            return "WDA runner app is not installed on the device"
+
+        if "no app with bundle id" in lowered:
+            return "WDA runner app is not installed on the device"
+
+        # If traceback is present, keep only the final exception line.
+        cleaned_lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not cleaned_lines:
+            return "WDA tap failed"
+
+        for line in reversed(cleaned_lines):
+            if "error" in line.lower() or "exception" in line.lower():
+                return line
+
+        return cleaned_lines[-1]
+
+    def _run_wda_tap(self, selector, using, xctrunner=None):
         """Try WDA tap by selector. Returns None on success or error text on failure."""
         if not self.udid:
             return "No device UDID available for WDA tap"
 
         cmd = [
+            sys.executable,
+            "-m",
             "pymobiledevice3",
             "developer",
             "wda",
@@ -116,8 +152,12 @@ class AccessibilityBridge:
             using,
             "--timeout",
             "6",
-            selector,
         ]
+
+        if xctrunner:
+            cmd.extend(["--xctrunner", xctrunner])
+
+        cmd.append(selector)
 
         try:
             result = subprocess.run(
@@ -138,7 +178,7 @@ class AccessibilityBridge:
         if result.returncode == 0 and "error" not in combined and "failed" not in combined:
             return None
 
-        return (stderr_text or stdout_text or "WDA tap failed").strip()
+        return self._compact_wda_error(stderr_text or stdout_text or "WDA tap failed")
 
     def _attempt_wda_tap_fallback(self):
         """Fallback tap using WebDriverAgent selectors based on focused caption."""
@@ -152,14 +192,22 @@ class AccessibilityBridge:
             candidates.append(primary)
 
         strategies = ["name", "label", "accessibility id"]
+        xctrunner_candidates = [None] + self.wda_xctrunner_candidates
         errors = []
 
         for sel in candidates:
             for using in strategies:
-                err = self._run_wda_tap(sel, using)
-                if err is None:
-                    return True, f"WDA tap succeeded via {using}: {sel}"
-                errors.append(f"{using}:{sel}: {err}")
+                for xctrunner in xctrunner_candidates:
+                    err = self._run_wda_tap(sel, using, xctrunner=xctrunner)
+                    if err is None:
+                        if xctrunner:
+                            return True, f"WDA tap succeeded via {using}: {sel} (runner: {xctrunner})"
+                        return True, f"WDA tap succeeded via {using}: {sel}"
+
+                    if xctrunner:
+                        errors.append(f"{using}:{sel}:{xctrunner}: {err}")
+                    else:
+                        errors.append(f"{using}:{sel}: {err}")
 
         return False, (errors[-1] if errors else "Unknown WDA error")
 
@@ -171,6 +219,121 @@ class AccessibilityBridge:
             element_obj.identifier if element_obj is not None else None
         )
         self.current_actions = self._extract_actions(current_item)
+
+    def _jsonify(self, value):
+        """Convert bridge values to JSON-safe values without failing the stream."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, bytes):
+            return value.hex()
+        if isinstance(value, (list, tuple)):
+            return [self._jsonify(item) for item in value]
+        if isinstance(value, dict):
+            return {str(k): self._jsonify(v) for k, v in value.items()}
+        if hasattr(value, "_fields"):
+            return {
+                str(k): self._jsonify(v)
+                for k, v in getattr(value, "_fields", {}).items()
+            }
+        return str(value)
+
+    def _extract_traits(self, focus_item):
+        """Best-effort extraction of element traits from focus item metadata."""
+        fields = getattr(focus_item, "_fields", {}) if focus_item is not None else {}
+        trait_candidates = []
+
+        for key, value in fields.items():
+            key_lower = str(key).lower()
+            if "trait" in key_lower:
+                trait_candidates.append(value)
+
+        if not trait_candidates:
+            return []
+
+        flattened = []
+        for candidate in trait_candidates:
+            normalized = self._jsonify(candidate)
+            if isinstance(normalized, list):
+                flattened.extend([str(item) for item in normalized if item is not None])
+            elif normalized is not None:
+                flattened.append(str(normalized))
+
+        # Preserve order while deduplicating.
+        deduped = []
+        seen = set()
+        for item in flattened:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    def _extract_bounds(self, focus_item):
+        """Best-effort extraction of x/y/width/height from focus metadata."""
+        fields = getattr(focus_item, "_fields", {}) if focus_item is not None else {}
+
+        rect_value = None
+        for key, value in fields.items():
+            key_lower = str(key).lower()
+            if "rect" in key_lower or "frame" in key_lower or "bounds" in key_lower:
+                rect_value = value
+                break
+
+        if rect_value is None:
+            return None
+
+        normalized = self._jsonify(rect_value)
+
+        if isinstance(normalized, dict):
+            x = normalized.get("x")
+            y = normalized.get("y")
+            width = normalized.get("width")
+            height = normalized.get("height")
+
+            # Handle nested "origin"/"size" style payloads.
+            if x is None and isinstance(normalized.get("origin"), dict):
+                x = normalized["origin"].get("x")
+                y = normalized["origin"].get("y")
+            if width is None and isinstance(normalized.get("size"), dict):
+                width = normalized["size"].get("width")
+                height = normalized["size"].get("height")
+
+            if None not in (x, y, width, height):
+                try:
+                    return {
+                        "x": float(x),
+                        "y": float(y),
+                        "width": float(width),
+                        "height": float(height),
+                    }
+                except (TypeError, ValueError):
+                    return None
+
+        if isinstance(normalized, list) and len(normalized) >= 4:
+            try:
+                return {
+                    "x": float(normalized[0]),
+                    "y": float(normalized[1]),
+                    "width": float(normalized[2]),
+                    "height": float(normalized[3]),
+                }
+            except (TypeError, ValueError):
+                return None
+
+        return None
+
+    def _build_focus_event(self, element):
+        """Build a structured focus event payload for streaming clients."""
+        if element is None:
+            return None
+
+        label = getattr(element, "caption", None) or getattr(element, "spoken_description", None) or ""
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "label": str(label),
+            "traits": self._extract_traits(element),
+            "bounds": self._extract_bounds(element),
+        }
 
     async def connect(self, udid):
         self.lockdown = await create_using_usbmux(serial=udid)
@@ -198,10 +361,27 @@ class AccessibilityBridge:
         if d is None:
             return {"error": f"Unknown direction: {direction}"}
 
+        # Drop stale events so we read the element change triggered by this move.
+        self._drain_event_queue()
         await self.service.move_focus(d)
 
         # Read the focused element from the event queue (no extra move)
         return await self._read_focused_element()
+
+    def _drain_event_queue(self):
+        """Drain queued events without blocking to avoid consuming stale focus updates."""
+        if not self.service:
+            return
+
+        queue = getattr(self.service, "_event_queue", None)
+        if queue is None:
+            return
+
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     async def _read_focused_element(self):
         """Read the hostInspectorCurrentElementChanged event to get the focused element."""
@@ -216,6 +396,9 @@ class AccessibilityBridge:
                 except asyncio.TimeoutError:
                     consecutive_timeouts += 1
                     if consecutive_timeouts >= 3:
+                        # Preserve last known focus when the event is delayed/missing.
+                        if self.current_element is not None:
+                            return self._format_element(self.current_element)
                         return {"ok": True, "element": None}
                     continue
 
@@ -237,7 +420,9 @@ class AccessibilityBridge:
                     current_item = event.data
 
                 self._cache_focus_item(current_item)
-                return self._format_element(current_item)
+                result = self._format_element(current_item)
+                result["focus_event"] = self._build_focus_event(current_item)
+                return result
         except Exception as e:
             return {"error": str(e)}
 
@@ -345,6 +530,18 @@ class AccessibilityBridge:
             after_caption = getattr(self.current_element, "caption", None)
 
             if before_caption == after_caption:
+                # Some iOS 16 controls ignore performAction but react to perform_press.
+                if activate_action is not None:
+                    await self.service.perform_press(element_ref)
+                    await self._sync_latest_focus_event(timeout=0.7)
+                    after_press_caption = getattr(self.current_element, "caption", None)
+                    if after_press_caption != before_caption:
+                        return {
+                            "ok": True,
+                            "action": "activate",
+                            "note": "Activated via AX press fallback.",
+                        }
+
                 wda_ok, wda_info = self._attempt_wda_tap_fallback()
                 if wda_ok:
                     # Confirm a visible focus/UI update after WDA fallback tap.
@@ -409,6 +606,12 @@ def write_response(data):
     sys.stdout.flush()
 
 
+def write_focus_event(event):
+    if not event:
+        return
+    write_response({"type": "focus:event", "event": event})
+
+
 async def main():
     bridge = AccessibilityBridge()
 
@@ -453,6 +656,9 @@ async def main():
         except Exception as e:
             result = {"error": str(e)}
 
+        focus_event = result.pop("focus_event", None) if isinstance(result, dict) else None
+        if focus_event:
+            write_focus_event(focus_event)
         write_response(result)
 
 

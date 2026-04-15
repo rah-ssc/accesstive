@@ -9,10 +9,39 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 const PORT = process.env.PORT || 3000;
+const PYTHON_BIN = process.env.ACCESSTIVE_PYTHON || 'python3.11';
+const MAX_FOCUS_EVENTS = 200;
 
 // Path to the built accesstive binary
 const ACCESSTIVE_BIN = path.resolve(__dirname, '..', '.build', 'debug', 'accesstive');
 const BRIDGE_SCRIPT = path.resolve(__dirname, '..', 'Scripts', 'accesstive-bridge.py');
+const focusEventBuffer = [];
+
+function pushFocusEvent(event) {
+    if (!event || typeof event !== 'object') {
+        return;
+    }
+    focusEventBuffer.push(event);
+    if (focusEventBuffer.length > MAX_FOCUS_EVENTS) {
+        focusEventBuffer.splice(0, focusEventBuffer.length - MAX_FOCUS_EVENTS);
+    }
+}
+
+function serialize(payload) {
+    return JSON.stringify(payload);
+}
+
+function safeSend(ws, payload) {
+    if (ws.readyState === 1) {
+        ws.send(serialize(payload));
+    }
+}
+
+function broadcast(payload) {
+    for (const client of wss.clients) {
+        safeSend(client, payload);
+    }
+}
 
 // Serve static frontend
 app.use(express.static(path.join(__dirname, 'public')));
@@ -77,6 +106,8 @@ wss.on('connection', (ws) => {
     let bridgeProcess = null;
     let watchProcess = null;
 
+    safeSend(ws, { type: 'focus:history', events: focusEventBuffer });
+
     ws.on('message', (raw) => {
         let msg;
         try {
@@ -95,24 +126,42 @@ wss.on('connection', (ws) => {
                 bridgeProcess = null;
             }
 
-            bridgeProcess = spawn('python3', [BRIDGE_SCRIPT], {
+            bridgeProcess = spawn(PYTHON_BIN, [BRIDGE_SCRIPT], {
                 stdio: ['pipe', 'pipe', 'pipe'],
             });
 
-            let buffer = '';
+            let stdoutBuffer = '';
+            let bridgeReady = false;
+            const udid = msg.udid;
 
             bridgeProcess.stdout.on('data', (chunk) => {
-                buffer += chunk.toString();
-                const lines = buffer.split('\n');
-                buffer = lines.pop(); // keep incomplete line
+                stdoutBuffer += chunk.toString();
+                const lines = stdoutBuffer.split('\n');
+                stdoutBuffer = lines.pop();
+
                 for (const line of lines) {
                     if (!line.trim()) continue;
+
+                    let parsed;
                     try {
-                        const data = JSON.parse(line);
-                        ws.send(JSON.stringify({ type: 'navigate:response', data }));
+                        parsed = JSON.parse(line);
                     } catch {
-                        // ignore non-JSON
+                        continue;
                     }
+
+                    if (parsed.ready && !bridgeReady) {
+                        bridgeReady = true;
+                        bridgeProcess.stdin.write(serialize({ action: 'connect', udid }) + '\n');
+                        continue;
+                    }
+
+                    if (parsed.type === 'focus:event') {
+                        pushFocusEvent(parsed.event);
+                        broadcast({ type: 'focus:event', event: parsed.event });
+                        continue;
+                    }
+
+                    safeSend(ws, { type: 'navigate:response', data: parsed });
                 }
             });
 
@@ -121,54 +170,18 @@ wss.on('connection', (ws) => {
             });
 
             bridgeProcess.on('close', (code) => {
-                ws.send(JSON.stringify({ type: 'navigate:disconnected', code }));
+                safeSend(ws, { type: 'navigate:disconnected', code });
                 bridgeProcess = null;
             });
 
             bridgeProcess.on('error', (err) => {
-                ws.send(JSON.stringify({ type: 'navigate:error', error: err.message }));
+                safeSend(ws, { type: 'navigate:error', error: err.message });
                 bridgeProcess = null;
             });
 
-            // Send connect command after bridge is ready
-            // The bridge sends {"ready": true} first, then we send connect
-            const udid = msg.udid;
-            let waitingForReady = true;
-
-            const originalHandler = bridgeProcess.stdout.listeners('data').slice(-1)[0];
-            // We need to intercept the ready message
-            const readyBuffer = { data: '' };
-
-            const readyListener = (chunk) => {
-                readyBuffer.data += chunk.toString();
-                const lines = readyBuffer.data.split('\n');
-                readyBuffer.data = lines.pop();
-                for (const line of lines) {
-                    if (!line.trim()) continue;
-                    try {
-                        const parsed = JSON.parse(line);
-                        if (parsed.ready && waitingForReady) {
-                            waitingForReady = false;
-                            // Send connect command
-                            bridgeProcess.stdin.write(
-                                JSON.stringify({ action: 'connect', udid }) + '\n'
-                            );
-                        } else {
-                            ws.send(JSON.stringify({ type: 'navigate:response', data: parsed }));
-                        }
-                    } catch {
-                        // ignore
-                    }
-                }
-            };
-
-            // Replace the handler
-            bridgeProcess.stdout.removeAllListeners('data');
-            bridgeProcess.stdout.on('data', readyListener);
-
         } else if (type === 'navigate:command') {
             if (!bridgeProcess) {
-                ws.send(JSON.stringify({ type: 'navigate:error', error: 'Not connected' }));
+                safeSend(ws, { type: 'navigate:error', error: 'Not connected' });
                 return;
             }
             const cmd = msg.command; // { action: 'next' | 'previous' | 'first' | 'last' | 'activate' | 'list' | 'disconnect' }
@@ -198,11 +211,11 @@ wss.on('connection', (ws) => {
             watchProcess = spawn(ACCESSTIVE_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
             watchProcess.stdout.on('data', (chunk) => {
-                ws.send(JSON.stringify({ type: 'watch:data', data: chunk.toString() }));
+                safeSend(ws, { type: 'watch:data', data: chunk.toString() });
             });
 
             watchProcess.on('close', () => {
-                ws.send(JSON.stringify({ type: 'watch:stopped' }));
+                safeSend(ws, { type: 'watch:stopped' });
                 watchProcess = null;
             });
 
@@ -211,6 +224,11 @@ wss.on('connection', (ws) => {
                 watchProcess.kill();
                 watchProcess = null;
             }
+        } else if (type === 'focus:clear') {
+            focusEventBuffer.length = 0;
+            broadcast({ type: 'focus:cleared' });
+        } else if (type === 'focus:get') {
+            safeSend(ws, { type: 'focus:history', events: focusEventBuffer });
         }
     });
 

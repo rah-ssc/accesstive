@@ -29,6 +29,7 @@
         <button class="tab" data-tab="audit">📋 Audit</button>
         <button class="tab" data-tab="navigate">🎮 Navigate</button>
         <button class="tab" data-tab="watch">👁 Watch</button>
+        <button class="tab" data-tab="focus-logs">🎯 Focus Logs</button>
     </nav>
 
     <main>
@@ -120,6 +121,21 @@
             </div>
             <div id="watchOutput" class="result watch-output">
                 <p class="placeholder">Start watching to monitor accessibility changes in real time.</p>
+            </div>
+        </section>
+
+        <!-- ===== FOCUS LOGS TAB ===== -->
+        <section id="tab-focus-logs" class="tab-content">
+            <div class="panel-header">
+                <h2>Focus Logs</h2>
+                <div class="controls">
+                    <span id="focusLogCount" class="stats-inline">0 events</span>
+                    <button id="focusLogDownload" class="btn btn-sm" title="Download focus logs as JSON">Download JSON</button>
+                    <button id="focusLogClear" class="btn btn-sm">Clear Logs</button>
+                </div>
+            </div>
+            <div id="focusLogs" class="result focus-log-output">
+                <p class="placeholder">Focus events will appear here when navigating elements.</p>
             </div>
         </section>
     </main>
