@@ -24,12 +24,14 @@ An iOS accessibility testing toolkit — **CLI + Web Dashboard** — powered by 
     - [Audit for Issues](#audit-for-issues)
     - [Navigate (Physical Devices)](#navigate-physical-devices)
     - [Watch Mode](#watch-mode)
+    - [Announcement Capture](#announcement-capture)
   - [Web Dashboard](#web-dashboard)
     - [Starting the Server](#starting-the-server)
     - [Dashboard Tabs](#dashboard-tabs)
     - [REST API](#rest-api)
     - [WebSocket Events](#websocket-events)
   - [Focus Logs Test Flow](#focus-logs-test-flow)
+  - [Announcement Validation Flow](#announcement-validation-flow)
   - [Built-in Audit Rules](#built-in-audit-rules)
   - [Architecture](#architecture)
   - [How It Works](#how-it-works)
@@ -52,6 +54,7 @@ An iOS accessibility testing toolkit — **CLI + Web Dashboard** — powered by 
 | **Navigate** |   ✅   |   ✅   | Interactively move through elements on physical devices |
 | **Activate** |   ✅   |   ✅   | Tap/press the currently focused element                 |
 | **Focus Logs** | ✅ | ✅ | Stream timestamped focus changes (label/traits/bounds) |
+| **Announcements** | ✅ | ✅ | Stream VoiceOver/system announcements with event typing |
 | **CI-Ready** |   ✅   |   —   | JUnit XML output and `--strict` exit codes              |
 
 ---
@@ -283,6 +286,22 @@ accesstive watch --interval 5
 accesstive watch --bundle-id com.example.myapp
 ```
 
+### Announcement Capture
+
+```bash
+# Capture VoiceOver/system accessibility announcements (JSON lines)
+accesstive announcements --device booted
+
+# Filter simulator capture to one app process
+accesstive announcements --device booted --bundle-id com.example.myapp
+
+# Capture announcements on a physical USB device
+accesstive announcements --device <UDID>
+
+# Limit capture to a validation window (seconds)
+accesstive announcements --device booted --duration 15
+```
+
 ---
 
 ## Web Dashboard
@@ -309,6 +328,7 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 | **Navigate** | Connect to a physical device and navigate elements interactively using on-screen buttons or keyboard shortcuts |
 | **Watch**    | Start real-time monitoring and see accessibility tree changes streamed live                                    |
 | **Focus Logs** | Live stream of focus events (timestamp, label, traits, bounds) with rolling 200-event history             |
+| **Announcements** | Live stream of announcement events with filters (All / Alerts / Screen Changes) and JSON export       |
 
 **Keyboard shortcuts in Navigate tab:**
 
@@ -343,6 +363,10 @@ Connect to `ws://localhost:3000` for real-time features:
 | `watch:stop`          | —                         | Stop monitoring                        |
 | `focus:get`           | —                         | Request current rolling focus history  |
 | `focus:clear`         | —                         | Clear rolling focus history            |
+| `announcements:start` | `{ device?, bundleId? }`  | Start announcement stream              |
+| `announcements:stop`  | —                         | Stop announcement stream               |
+| `announcements:get`   | —                         | Request rolling announcement history   |
+| `announcements:clear` | —                         | Clear rolling announcement history     |
 
 **Server → Client:**
 
@@ -356,6 +380,12 @@ Connect to `ws://localhost:3000` for real-time features:
 | `focus:history`         | `{ events }`| Last 200 focus events         |
 | `focus:event`           | `{ event }` | One streamed focus event      |
 | `focus:cleared`         | —           | Focus history was cleared     |
+| `announcement:status`   | `{ status }`| Announcement stream state     |
+| `announcement:history`  | `{ events }`| Last 500 announcement events  |
+| `announcement:event`    | `{ event }` | One streamed announcement     |
+| `announcement:cleared`  | —           | Announcement history cleared  |
+| `announcement:stopped`  | `{ code }`  | Announcement stream ended     |
+| `announcement:error`    | `{ error }` | Announcement stream error     |
 
 ---
 
@@ -384,6 +414,43 @@ The test will:
 
 ---
 
+## Announcement Validation Flow
+
+### Simulator Validation
+
+```bash
+# 1) Build CLI
+swift build
+
+# 2) Ensure simulator is booted
+xcrun simctl bootstatus booted -b
+
+# 3) Start dashboard server (terminal A)
+npm --prefix web start
+
+# 4) Start announcement websocket smoke test (terminal B)
+npm --prefix web run test:announcements
+```
+
+In the simulator app under test, trigger VoiceOver/system announcements (alerts, screen transitions, custom announcements).
+
+### Real Device Validation
+
+```bash
+# 1) Confirm USB device is visible
+idevice_id -l
+
+# 2) Start dashboard server (terminal A)
+npm --prefix web start
+
+# 3) Run announcement smoke test for a specific UDID (terminal B)
+ACCESSTIVE_DEVICE=<UDID> npm --prefix web run test:announcements
+```
+
+On the device, enable VoiceOver and navigate through alert/screen-change flows. Confirm typed events appear in the Announcements tab and exported JSON contains `timestamp`, `event_type`, and `text`.
+
+---
+
 ## Built-in Audit Rules
 
 | Rule ID | Name                        | Severity | Description                                 |
@@ -404,13 +471,14 @@ The test will:
 accesstive/
 ├── Package.swift                         # Swift Package manifest (macOS 14+, ArgumentParser)
 ├── Sources/accesstive/
-│   ├── Accesstive.swift                  # @main entry point, 5 subcommands
+│   ├── Accesstive.swift                  # @main entry point, 6 subcommands
 │   ├── Commands/
 │   │   ├── Inspect.swift                 # Dump accessibility tree
 │   │   ├── Audit.swift                   # Run audit rules
 │   │   ├── ListDevices.swift             # List simulators & physical devices
 │   │   ├── Watch.swift                   # Live monitoring with diffs
-│   │   └── Navigate.swift               # Interactive REPL via Python bridge
+│   │   ├── Announcements.swift           # Accessibility announcement JSON stream
+│   │   └── Navigate.swift                # Interactive REPL via Python bridge
 │   ├── Core/
 │   │   ├── DeviceConnector.swift         # simctl + idevice_id + ideviceinfo
 │   │   └── AccessibilityInspector.swift  # AXUIElement (sim) + pymobiledevice3 (physical)
@@ -429,7 +497,7 @@ accesstive/
     ├── package.json                      # Express 5 + ws dependencies
     ├── server.js                         # REST API + WebSocket server
     └── public/
-        ├── index.html                    # Dashboard (4-tab layout)
+        ├── index.html                    # Dashboard (announcements + focus logs tabs)
         ├── style.css                     # Dark theme
         └── app.js                        # Frontend logic + keyboard navigation
 ```

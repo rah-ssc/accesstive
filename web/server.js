@@ -11,11 +11,13 @@ const wss = new WebSocketServer({ server });
 const PORT = process.env.PORT || 3000;
 const PYTHON_BIN = process.env.ACCESSTIVE_PYTHON || 'python3.11';
 const MAX_FOCUS_EVENTS = 200;
+const MAX_ANNOUNCEMENT_EVENTS = 500;
 
 // Path to the built accesstive binary
 const ACCESSTIVE_BIN = path.resolve(__dirname, '..', '.build', 'debug', 'accesstive');
 const BRIDGE_SCRIPT = path.resolve(__dirname, '..', 'Scripts', 'accesstive-bridge.py');
 const focusEventBuffer = [];
+const announcementEventBuffer = [];
 
 function pushFocusEvent(event) {
     if (!event || typeof event !== 'object') {
@@ -29,6 +31,35 @@ function pushFocusEvent(event) {
 
 function serialize(payload) {
     return JSON.stringify(payload);
+}
+
+function pushAnnouncementEvent(event) {
+    if (!event || typeof event !== 'object') {
+        return;
+    }
+    announcementEventBuffer.push(event);
+    if (announcementEventBuffer.length > MAX_ANNOUNCEMENT_EVENTS) {
+        announcementEventBuffer.splice(0, announcementEventBuffer.length - MAX_ANNOUNCEMENT_EVENTS);
+    }
+}
+
+function buildAnnouncementFromFocusEvent(event) {
+    if (!event || typeof event !== 'object') {
+        return null;
+    }
+
+    const label = typeof event.label === 'string' ? event.label.trim() : '';
+    if (!label) {
+        return null;
+    }
+
+    return {
+        timestamp: event.timestamp || new Date().toISOString(),
+        event_type: 'focus_change',
+        text: label,
+        source: 'focus_stream',
+        raw_event_name: 'focus:event',
+    };
 }
 
 function safeSend(ws, payload) {
@@ -105,8 +136,10 @@ app.post('/api/audit', (req, res) => {
 wss.on('connection', (ws) => {
     let bridgeProcess = null;
     let watchProcess = null;
+    let announcementProcess = null;
 
     safeSend(ws, { type: 'focus:history', events: focusEventBuffer });
+    safeSend(ws, { type: 'announcement:history', events: announcementEventBuffer });
 
     ws.on('message', (raw) => {
         let msg;
@@ -158,6 +191,12 @@ wss.on('connection', (ws) => {
                     if (parsed.type === 'focus:event') {
                         pushFocusEvent(parsed.event);
                         broadcast({ type: 'focus:event', event: parsed.event });
+
+                        const fallbackAnnouncement = buildAnnouncementFromFocusEvent(parsed.event);
+                        if (fallbackAnnouncement) {
+                            pushAnnouncementEvent(fallbackAnnouncement);
+                            broadcast({ type: 'announcement:event', event: fallbackAnnouncement });
+                        }
                         continue;
                     }
 
@@ -224,6 +263,80 @@ wss.on('connection', (ws) => {
                 watchProcess.kill();
                 watchProcess = null;
             }
+        } else if (type === 'announcements:start') {
+            if (announcementProcess) {
+                announcementProcess.kill();
+                announcementProcess = null;
+            }
+
+            const device = msg.device || 'booted';
+            const args = ['announcements', '--device', device];
+
+            if (msg.bundleId) {
+                args.push('--bundle-id', msg.bundleId);
+            }
+
+            announcementProcess = spawn(ACCESSTIVE_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+            let stdoutBuffer = '';
+            announcementProcess.stdout.on('data', (chunk) => {
+                stdoutBuffer += chunk.toString();
+                const lines = stdoutBuffer.split('\n');
+                stdoutBuffer = lines.pop();
+
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+
+                    let parsed;
+                    try {
+                        parsed = JSON.parse(line);
+                    } catch {
+                        continue;
+                    }
+
+                    const event = parsed && parsed.type === 'announcement:event'
+                        ? parsed.event
+                        : parsed;
+
+                    if (!event || typeof event !== 'object' || !event.text) {
+                        continue;
+                    }
+
+                    pushAnnouncementEvent(event);
+                    broadcast({ type: 'announcement:event', event });
+                }
+            });
+
+            announcementProcess.stderr.on('data', () => {
+                // Ignore stderr noise from simctl/pymobiledevice3 subprocesses.
+            });
+
+            announcementProcess.on('close', (code) => {
+                broadcast({ type: 'announcement:stopped', code });
+                announcementProcess = null;
+            });
+
+            announcementProcess.on('error', (err) => {
+                safeSend(ws, { type: 'announcement:error', error: err.message });
+                announcementProcess = null;
+            });
+
+            safeSend(ws, {
+                type: 'announcement:status',
+                status: 'started',
+                device,
+                bundleId: msg.bundleId || null,
+            });
+        } else if (type === 'announcements:stop') {
+            if (announcementProcess) {
+                announcementProcess.kill();
+                announcementProcess = null;
+            }
+        } else if (type === 'announcements:get') {
+            safeSend(ws, { type: 'announcement:history', events: announcementEventBuffer });
+        } else if (type === 'announcements:clear') {
+            announcementEventBuffer.length = 0;
+            broadcast({ type: 'announcement:cleared' });
         } else if (type === 'focus:clear') {
             focusEventBuffer.length = 0;
             broadcast({ type: 'focus:cleared' });
@@ -240,6 +353,10 @@ wss.on('connection', (ws) => {
         if (watchProcess) {
             watchProcess.kill();
             watchProcess = null;
+        }
+        if (announcementProcess) {
+            announcementProcess.kill();
+            announcementProcess = null;
         }
     });
 });

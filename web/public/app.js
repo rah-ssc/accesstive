@@ -4,6 +4,10 @@ let ws = null;
 let navConnected = false;
 const focusLogEvents = [];
 const MAX_FOCUS_EVENTS = 200;
+const announcementEvents = [];
+const MAX_ANNOUNCEMENT_EVENTS = 500;
+let announcementFilter = 'all';
+let announcementCapturing = false;
 
 // ---------- DOM ----------
 const $ = (sel) => document.querySelector(sel);
@@ -18,6 +22,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupNavigate();
     setupWatch();
     setupFocusLogs();
+    setupAnnouncements();
     setupKeyboardNav();
     connectWebSocket();
 
@@ -321,6 +326,7 @@ function connectWebSocket() {
     ws.addEventListener('open', () => {
         console.log('WebSocket connected');
         ws.send(JSON.stringify({ type: 'focus:get' }));
+        ws.send(JSON.stringify({ type: 'announcements:get' }));
     });
     ws.addEventListener('close', () => {
         console.log('WebSocket disconnected');
@@ -328,6 +334,8 @@ function connectWebSocket() {
             navConnected = false;
             updateNavUI(false);
         }
+        announcementCapturing = false;
+        updateAnnouncementButtons();
     });
     ws.addEventListener('error', (err) => console.error('WebSocket error:', err));
 
@@ -370,6 +378,28 @@ function handleWsMessage(msg) {
             break;
         case 'focus:cleared':
             setFocusHistory([]);
+            break;
+        case 'announcement:event':
+            appendAnnouncementEvent(msg.event);
+            break;
+        case 'announcement:history':
+            setAnnouncementHistory(msg.events || []);
+            break;
+        case 'announcement:cleared':
+            setAnnouncementHistory([]);
+            break;
+        case 'announcement:status':
+            showAnnouncementStatus('Announcement capture started', 'var(--green)');
+            announcementCapturing = true;
+            updateAnnouncementButtons();
+            break;
+        case 'announcement:stopped':
+            announcementCapturing = false;
+            updateAnnouncementButtons();
+            showAnnouncementStatus('Announcement capture stopped', 'var(--text-dim)');
+            break;
+        case 'announcement:error':
+            showAnnouncementStatus(`Error: ${msg.error || 'Unknown error'}`, 'var(--red)');
             break;
     }
 }
@@ -659,6 +689,178 @@ function formatFocusBounds(bounds) {
 
 function updateFocusLogCount() {
     $('#focusLogCount').textContent = `${focusLogEvents.length} event${focusLogEvents.length === 1 ? '' : 's'}`;
+}
+
+// ---------- Announcements ----------
+function setupAnnouncements() {
+    $('#announcementStart').addEventListener('click', startAnnouncements);
+    $('#announcementStop').addEventListener('click', stopAnnouncements);
+    $('#announcementExport').addEventListener('click', exportAnnouncements);
+    $('#announcementClear').addEventListener('click', clearAnnouncements);
+    $('#announcementFilter').addEventListener('change', (event) => {
+        announcementFilter = event.target.value;
+        renderAnnouncements();
+    });
+    updateAnnouncementCount();
+    updateAnnouncementButtons();
+}
+
+function startAnnouncements() {
+    if (!requireDevice()) return;
+
+    const socket = connectWebSocket();
+
+    const doStart = () => {
+        socket.send(JSON.stringify({
+            type: 'announcements:start',
+            device: selectedDevice,
+        }));
+    };
+
+    if (socket.readyState === WebSocket.OPEN) {
+        doStart();
+    } else {
+        socket.addEventListener('open', doStart, { once: true });
+    }
+}
+
+function stopAnnouncements() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'announcements:stop' }));
+    }
+    announcementCapturing = false;
+    updateAnnouncementButtons();
+}
+
+function exportAnnouncements() {
+    const exported = getFilteredAnnouncements();
+    const payload = JSON.stringify(exported, null, 2);
+    const blob = new Blob([payload], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+
+    link.href = url;
+    link.download = `announcements-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+}
+
+function clearAnnouncements() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'announcements:clear' }));
+    }
+    setAnnouncementHistory([]);
+}
+
+function setAnnouncementHistory(events) {
+    announcementEvents.length = 0;
+    const safeEvents = Array.isArray(events) ? events.slice(-MAX_ANNOUNCEMENT_EVENTS) : [];
+    safeEvents.forEach((event) => announcementEvents.push(event));
+    renderAnnouncements();
+}
+
+function appendAnnouncementEvent(event) {
+    if (!event || typeof event !== 'object') return;
+    announcementEvents.push(event);
+    while (announcementEvents.length > MAX_ANNOUNCEMENT_EVENTS) {
+        announcementEvents.shift();
+    }
+    renderAnnouncements();
+}
+
+function getFilteredAnnouncements() {
+    if (announcementFilter === 'all') {
+        return announcementEvents;
+    }
+    return announcementEvents.filter((event) => {
+        const normalized = normalizeAnnouncementType(event.event_type);
+        if (announcementFilter === 'screen_change') {
+            return normalized === 'screen_change' || normalized === 'focus_change';
+        }
+        return normalized === announcementFilter;
+    });
+}
+
+function renderAnnouncements() {
+    const output = $('#announcementList');
+    const filtered = getFilteredAnnouncements();
+
+    output.innerHTML = '';
+    if (filtered.length === 0) {
+        output.innerHTML = '<p class="placeholder">No announcements for the current filter.</p>';
+        updateAnnouncementCount();
+        return;
+    }
+
+    filtered.forEach((event) => {
+        output.appendChild(buildAnnouncementRow(event));
+    });
+
+    output.scrollTop = output.scrollHeight;
+    updateAnnouncementCount(filtered.length);
+}
+
+function buildAnnouncementRow(event) {
+    const row = document.createElement('div');
+    row.className = 'announcement-entry';
+
+    const type = normalizeAnnouncementType(event.event_type);
+    const timestamp = formatFocusTimestamp(event.timestamp);
+    const text = event.text || '(empty announcement)';
+    const source = event.source || 'unknown';
+
+    row.innerHTML = `
+    <div class="announcement-top">
+      <span class="timestamp">${escapeHtml(timestamp)}</span>
+      <span class="announcement-type type-${escapeHtml(type)}">${escapeHtml(formatAnnouncementType(type))}</span>
+      <span class="announcement-source">${escapeHtml(source)}</span>
+    </div>
+    <div class="announcement-text">${escapeHtml(text)}</div>`;
+
+    return row;
+}
+
+function normalizeAnnouncementType(type) {
+    if (typeof type !== 'string') return 'announcement';
+    if (type === 'alert') return 'alert';
+    if (type === 'screen_change') return 'screen_change';
+    if (type === 'focus_change') return 'focus_change';
+    return 'announcement';
+}
+
+function formatAnnouncementType(type) {
+    if (type === 'alert') return 'Alert';
+    if (type === 'screen_change') return 'Screen Change';
+    if (type === 'focus_change') return 'Focus Change';
+    return 'Announcement';
+}
+
+function updateAnnouncementCount(filteredCount) {
+    const count = typeof filteredCount === 'number' ? filteredCount : getFilteredAnnouncements().length;
+    $('#announcementCount').textContent = `${count} event${count === 1 ? '' : 's'}`;
+}
+
+function updateAnnouncementButtons() {
+    if (announcementCapturing) {
+        hide('#announcementStart');
+        show('#announcementStop');
+    } else {
+        show('#announcementStart');
+        hide('#announcementStop');
+    }
+}
+
+function showAnnouncementStatus(text, color) {
+    const status = $('#announcementStatus');
+    status.textContent = text;
+    status.style.background = `${color}22`;
+    status.style.color = color;
+    show('#announcementStatus');
+    setTimeout(() => {
+        hide('#announcementStatus');
+    }, 3000);
 }
 
 // ---------- Helpers ----------

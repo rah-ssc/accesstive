@@ -30,6 +30,7 @@
         <button class="tab" data-tab="navigate">🎮 Navigate</button>
         <button class="tab" data-tab="watch">👁 Watch</button>
         <button class="tab" data-tab="focus-logs">🎯 Focus Logs</button>
+        <button class="tab" data-tab="announcements">📣 Announcements</button>
     </nav>
 
     <main>
@@ -136,6 +137,29 @@
             </div>
             <div id="focusLogs" class="result focus-log-output">
                 <p class="placeholder">Focus events will appear here when navigating elements.</p>
+            </div>
+        </section>
+
+        <!-- ===== ANNOUNCEMENTS TAB ===== -->
+        <section id="tab-announcements" class="tab-content">
+            <div class="panel-header">
+                <h2>Accessibility Announcements</h2>
+                <div class="controls">
+                    <select id="announcementFilter" title="Filter announcement event type">
+                        <option value="all">All</option>
+                        <option value="alert">Alerts</option>
+                        <option value="screen_change">Screen Changes</option>
+                    </select>
+                    <span id="announcementCount" class="stats-inline">0 events</span>
+                    <button id="announcementStart" class="btn btn-primary">Start Capture</button>
+                    <button id="announcementStop" class="btn btn-danger hidden">Stop</button>
+                    <button id="announcementExport" class="btn btn-sm">Export JSON</button>
+                    <button id="announcementClear" class="btn btn-sm">Clear</button>
+                </div>
+            </div>
+            <div id="announcementStatus" class="nav-status hidden"></div>
+            <div id="announcementList" class="result announcement-output">
+                <p class="placeholder">Start capture to stream VoiceOver/system accessibility announcements.</p>
             </div>
         </section>
     </main>

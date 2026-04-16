@@ -11,6 +11,7 @@ struct Accesstive: AsyncParsableCommand {
             Audit.self,
             ListDevices.self,
             Watch.self,
+            Announcements.self,
             Navigate.self,
         ],
         defaultSubcommand: Inspect.self

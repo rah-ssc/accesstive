@@ -501,6 +501,69 @@ main {
     margin-top: 4px;
 }
 
+/* ---------- Announcements ---------- */
+.announcement-output {
+    font-family: 'SF Mono', 'Menlo', monospace;
+    font-size: 12px;
+    max-height: 70vh;
+    overflow-y: auto;
+}
+
+.announcement-entry {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+}
+
+.announcement-entry:last-child {
+    border-bottom: none;
+}
+
+.announcement-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+}
+
+.announcement-type {
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.announcement-type.type-alert {
+    background: rgba(248, 81, 73, 0.16);
+    color: var(--red);
+}
+
+.announcement-type.type-screen_change {
+    background: rgba(88, 166, 255, 0.16);
+    color: var(--accent);
+}
+
+.announcement-type.type-focus_change {
+    background: rgba(188, 140, 255, 0.16);
+    color: var(--purple);
+}
+
+.announcement-type.type-announcement {
+    background: rgba(63, 185, 80, 0.16);
+    color: var(--green);
+}
+
+.announcement-source {
+    color: var(--text-dim);
+    font-size: 11px;
+}
+
+.announcement-text {
+    color: var(--text);
+    line-height: 1.4;
+    white-space: pre-wrap;
+}
+
 /* ---------- Element list ---------- */
 .element-list-item {
     padding: 6px 12px;

@@ -40,10 +40,133 @@ class AccessibilityBridge:
         self.current_element_bytes = None
         self.current_actions = []
         self._monitoring_ready = False
+        self._announcement_monitor_task = None
+        self._announcement_monitor_running = False
+        self._last_announcement_signature = None
         self.wda_xctrunner_candidates = [
             "com.facebook.WebDriverAgentRunner.xctrunner",
             "com.pcloudywda.WebDriverAgentRunner.xctrunner",
         ]
+
+    def _classify_announcement_type(self, event_name, text):
+        value = f"{event_name or ''} {text or ''}".lower()
+        if "focus" in value or "currentelementchanged" in value:
+            return "focus_change"
+        if "alert" in value:
+            return "alert"
+        if "screen" in value or "layout" in value:
+            return "screen_change"
+        return "announcement"
+
+    def _find_first_text(self, value):
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            preferred_keys = [
+                "announcement",
+                "Announcement",
+                "message",
+                "Message",
+                "caption",
+                "spoken_description",
+                "label",
+                "value",
+            ]
+            for key in preferred_keys:
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+
+            for candidate in value.values():
+                found = self._find_first_text(candidate)
+                if found:
+                    return found
+            return ""
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                found = self._find_first_text(item)
+                if found:
+                    return found
+            return ""
+
+        return ""
+
+    def _build_announcement_event(self, event):
+        payload = self._jsonify(getattr(event, "data", None))
+        event_name = str(getattr(event, "name", "") or "")
+        text = self._find_first_text(payload)
+
+        if not text:
+            text = event_name
+
+        if not text:
+            return None
+
+        merged = f"{event_name} {text}".lower()
+        keywords = [
+            "announcement",
+            "voiceover",
+            "accessibility",
+            "screen",
+            "layout",
+            "alert",
+            "notification",
+            "focus",
+            "selected",
+            "activated",
+            "current",
+        ]
+        accessibility_event_names = [
+            "hostinspectorcurrentelementchanged",
+            "announcement",
+            "screen",
+            "layout",
+            "focus",
+            "notification",
+        ]
+        event_name_l = event_name.lower()
+
+        if not any(token in merged for token in keywords) and not any(
+            token in event_name_l for token in accessibility_event_names
+        ):
+            return None
+
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event_type": self._classify_announcement_type(event_name, text),
+            "text": text,
+            "source": "device",
+            "raw_event_name": event_name,
+        }
+
+    def _build_focus_announcement_event(self, focus_item, event_name):
+        if focus_item is None:
+            return None
+
+        label = (
+            getattr(focus_item, "spoken_description", None)
+            or getattr(focus_item, "caption", None)
+            or ""
+        )
+        label = str(label).strip()
+        if not label:
+            return None
+
+        signature = (str(event_name), label)
+        if signature == self._last_announcement_signature:
+            return None
+        self._last_announcement_signature = signature
+
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event_type": "focus_change",
+            "text": label,
+            "source": "device_focus",
+            "raw_event_name": str(event_name or "hostInspectorCurrentElementChanged:"),
+        }
 
     def _activation_help_hint(self):
         """Return platform-specific guidance for activation fallbacks."""
@@ -589,7 +712,79 @@ class AccessibilityBridge:
 
         return {"ok": True, "elements": elements, "count": len(elements)}
 
+    async def start_announcement_monitor(self):
+        if not self.service:
+            return {"error": "Not connected"}
+
+        if self._announcement_monitor_task and not self._announcement_monitor_task.done():
+            return {"ok": True, "monitoring": "announcements"}
+
+        self._announcement_monitor_running = True
+        self._announcement_monitor_task = asyncio.create_task(self._monitor_announcements())
+        return {"ok": True, "monitoring": "announcements"}
+
+    async def stop_announcement_monitor(self):
+        self._announcement_monitor_running = False
+
+        if self._announcement_monitor_task:
+            self._announcement_monitor_task.cancel()
+            try:
+                await self._announcement_monitor_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._announcement_monitor_task = None
+
+        return {"ok": True}
+
+    async def _monitor_announcements(self):
+        if not self.service:
+            return
+
+        from pymobiledevice3.services.accessibilityaudit import Event
+
+        while self._announcement_monitor_running and self.service:
+            try:
+                name, args = await self.service._event_queue.get()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
+
+            payload = self.service._extract_event_payload(args)
+            if payload is None:
+                continue
+
+            try:
+                event = Event(name=name, data=deserialize_object(payload))
+            except Exception:
+                continue
+
+            emitted_focus_announcement = False
+            if event.name == "hostInspectorCurrentElementChanged:":
+                if isinstance(event.data, list) and event.data:
+                    self._cache_focus_item(event.data[0])
+                    focus_event = self._build_focus_announcement_event(event.data[0], event.name)
+                    if focus_event:
+                        write_announcement_event(focus_event)
+                        emitted_focus_announcement = True
+                elif event.data is not None:
+                    self._cache_focus_item(event.data)
+                    focus_event = self._build_focus_announcement_event(event.data, event.name)
+                    if focus_event:
+                        write_announcement_event(focus_event)
+                        emitted_focus_announcement = True
+
+            if emitted_focus_announcement:
+                continue
+
+            announcement_event = self._build_announcement_event(event)
+            if announcement_event:
+                write_announcement_event(announcement_event)
+
     async def disconnect(self):
+        await self.stop_announcement_monitor()
         if self.service:
             try:
                 await self.service.close()
@@ -610,6 +805,12 @@ def write_focus_event(event):
     if not event:
         return
     write_response({"type": "focus:event", "event": event})
+
+
+def write_announcement_event(event):
+    if not event:
+        return
+    write_response({"type": "announcement:event", "event": event})
 
 
 async def main():
@@ -647,6 +848,10 @@ async def main():
                 result = await bridge.activate()
             elif action == "list":
                 result = await bridge.list_elements()
+            elif action == "monitor_announcements":
+                result = await bridge.start_announcement_monitor()
+            elif action == "stop_monitor_announcements":
+                result = await bridge.stop_announcement_monitor()
             elif action == "disconnect":
                 result = await bridge.disconnect()
                 write_response(result)

@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test:focus-logs": "node scripts/focus-logs-test.js"
+    "test:focus-logs": "node scripts/focus-logs-test.js",
+    "test:announcements": "node scripts/announcements-test.js"
   },
   "keywords": [],
   "author": "",
