@@ -7,6 +7,7 @@ const MAX_FOCUS_EVENTS = 200;
 const announcementEvents = [];
 const MAX_ANNOUNCEMENT_EVENTS = 500;
 let announcementFilter = 'all';
+let announcementSearchQuery = '';
 let announcementCapturing = false;
 
 // ---------- DOM ----------
@@ -701,6 +702,10 @@ function setupAnnouncements() {
         announcementFilter = event.target.value;
         renderAnnouncements();
     });
+    $('#announcementSearch').addEventListener('input', (event) => {
+        announcementSearchQuery = event.target.value.trim();
+        renderAnnouncements();
+    });
     updateAnnouncementCount();
     updateAnnouncementButtons();
 }
@@ -733,8 +738,7 @@ function stopAnnouncements() {
 }
 
 function exportAnnouncements() {
-    const exported = getFilteredAnnouncements();
-    const payload = JSON.stringify(exported, null, 2);
+    const payload = JSON.stringify(buildAnnouncementExport(), null, 2);
     const blob = new Blob([payload], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -757,13 +761,14 @@ function clearAnnouncements() {
 function setAnnouncementHistory(events) {
     announcementEvents.length = 0;
     const safeEvents = Array.isArray(events) ? events.slice(-MAX_ANNOUNCEMENT_EVENTS) : [];
-    safeEvents.forEach((event) => announcementEvents.push(event));
+    safeEvents.map(normalizeAnnouncementPayload).filter(Boolean).forEach((event) => announcementEvents.push(event));
     renderAnnouncements();
 }
 
 function appendAnnouncementEvent(event) {
-    if (!event || typeof event !== 'object') return;
-    announcementEvents.push(event);
+    const normalized = normalizeAnnouncementPayload(event);
+    if (!normalized) return;
+    announcementEvents.push(normalized);
     while (announcementEvents.length > MAX_ANNOUNCEMENT_EVENTS) {
         announcementEvents.shift();
     }
@@ -771,15 +776,33 @@ function appendAnnouncementEvent(event) {
 }
 
 function getFilteredAnnouncements() {
-    if (announcementFilter === 'all') {
-        return announcementEvents;
-    }
     return announcementEvents.filter((event) => {
-        const normalized = normalizeAnnouncementType(event.event_type);
-        if (announcementFilter === 'screen_change') {
-            return normalized === 'screen_change' || normalized === 'focus_change';
+        const type = normalizeAnnouncementType(event.type || event.event_type);
+        const matchesType = announcementFilter === 'all' ? true : type === announcementFilter;
+        if (!matchesType) {
+            return false;
         }
-        return normalized === announcementFilter;
+
+        if (!announcementSearchQuery) {
+            return true;
+        }
+
+        const haystack = [
+            event.text,
+            event.screen,
+            event.source,
+            event.expectedText,
+            event.validation && event.validation.status,
+            event.validation && event.validation.expectedText,
+            event.element && event.element.label,
+            event.element && event.element.id,
+            event.raw_event_name,
+        ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+
+        return haystack.includes(announcementSearchQuery.toLowerCase());
     });
 }
 
@@ -794,8 +817,12 @@ function renderAnnouncements() {
         return;
     }
 
-    filtered.forEach((event) => {
-        output.appendChild(buildAnnouncementRow(event));
+    const flows = groupAnnouncementEvents(filtered);
+    flows.forEach((flow, index) => {
+        output.appendChild(buildAnnouncementFlowHeader(flow, index));
+        flow.events.forEach((event) => {
+            output.appendChild(buildAnnouncementRow(event));
+        });
     });
 
     output.scrollTop = output.scrollHeight;
@@ -804,37 +831,159 @@ function renderAnnouncements() {
 
 function buildAnnouncementRow(event) {
     const row = document.createElement('div');
-    row.className = 'announcement-entry';
+    const type = normalizeAnnouncementType(event.type || event.event_type);
+    const validation = event.validation || null;
+    row.className = `announcement-entry announcement-type-${type}${validation && validation.status === 'mismatch' ? ' validation-mismatch' : ''}`;
 
-    const type = normalizeAnnouncementType(event.event_type);
     const timestamp = formatFocusTimestamp(event.timestamp);
     const text = event.text || '(empty announcement)';
-    const source = event.source || 'unknown';
+    const source = event.source || 'voiceover';
+    const screen = event.screen || '';
+    const elementLabel = event.element && event.element.label ? event.element.label : '';
+    const elementId = event.element && event.element.id ? event.element.id : '';
+    const validationBadge = validation && validation.status
+        ? `<span class="announcement-validation validation-${escapeHtml(validation.status)}">${escapeHtml(validation.status)}</span>`
+        : '';
+    const expected = event.expectedText || (validation && validation.expectedText) || '';
 
     row.innerHTML = `
     <div class="announcement-top">
       <span class="timestamp">${escapeHtml(timestamp)}</span>
       <span class="announcement-type type-${escapeHtml(type)}">${escapeHtml(formatAnnouncementType(type))}</span>
       <span class="announcement-source">${escapeHtml(source)}</span>
+      ${screen ? `<span class="announcement-screen">${escapeHtml(screen)}</span>` : ''}
+      ${validationBadge}
     </div>
     <div class="announcement-text">${escapeHtml(text)}</div>`;
+
+    if (elementLabel || elementId || expected) {
+        const meta = document.createElement('div');
+        meta.className = 'announcement-meta';
+        meta.innerHTML = `${elementLabel ? `<span>Element: ${escapeHtml(elementLabel)}</span>` : ''}${elementId ? `<span>ID: ${escapeHtml(elementId)}</span>` : ''}${expected ? `<span>Expected: ${escapeHtml(expected)}</span>` : ''}`;
+        row.appendChild(meta);
+    }
+
+    if (validation && validation.status === 'mismatch') {
+        const mismatch = document.createElement('div');
+        mismatch.className = 'announcement-mismatch';
+        mismatch.textContent = `Expected "${validation.expectedText || expected || ''}" but received "${validation.actualText || text}"`;
+        row.appendChild(mismatch);
+    }
 
     return row;
 }
 
 function normalizeAnnouncementType(type) {
-    if (typeof type !== 'string') return 'announcement';
+    if (typeof type !== 'string') return 'dynamic_update';
     if (type === 'alert') return 'alert';
     if (type === 'screen_change') return 'screen_change';
     if (type === 'focus_change') return 'focus_change';
-    return 'announcement';
+    if (type === 'dynamic_update') return 'dynamic_update';
+    return 'dynamic_update';
 }
 
 function formatAnnouncementType(type) {
     if (type === 'alert') return 'Alert';
     if (type === 'screen_change') return 'Screen Change';
     if (type === 'focus_change') return 'Focus Change';
+    if (type === 'dynamic_update') return 'Dynamic Update';
     return 'Announcement';
+}
+
+function buildAnnouncementFlowHeader(flow, index) {
+    const header = document.createElement('div');
+    header.className = 'announcement-flow-header';
+
+    const sessionText = flow.sessionId ? `Session ${shortId(flow.sessionId)}` : 'Session';
+    const screenText = flow.screen ? ` · ${escapeHtml(flow.screen)}` : '';
+
+    header.innerHTML = `
+      <span class="announcement-flow-label">Flow ${index + 1}</span>
+      <span class="announcement-flow-session">${escapeHtml(sessionText)}</span>
+      ${screenText ? `<span class="announcement-flow-screen">${screenText}</span>` : ''}
+    `;
+
+    return header;
+}
+
+function groupAnnouncementEvents(events) {
+    const groups = [];
+    let currentGroup = null;
+
+    events.forEach((event) => {
+        const flowId = event.flowId || event.sessionId || 'default-flow';
+        if (!currentGroup || currentGroup.flowId !== flowId) {
+            currentGroup = {
+                flowId,
+                sessionId: event.sessionId || '',
+                screen: event.screen || '',
+                events: [],
+            };
+            groups.push(currentGroup);
+        }
+
+        currentGroup.events.push(event);
+        if (!currentGroup.screen && event.screen) {
+            currentGroup.screen = event.screen;
+        }
+    });
+
+    return groups;
+}
+
+function buildAnnouncementExport() {
+    const events = getFilteredAnnouncements();
+    const flows = groupAnnouncementEvents(events).map((flow) => ({
+        flowId: flow.flowId,
+        sessionId: flow.sessionId,
+        screen: flow.screen,
+        count: flow.events.length,
+        events: flow.events,
+    }));
+
+    return {
+        generatedAt: new Date().toISOString(),
+        count: events.length,
+        filter: {
+            type: announcementFilter,
+            search: announcementSearchQuery,
+        },
+        events,
+        flows,
+    };
+}
+
+function normalizeAnnouncementPayload(event) {
+    if (!event || typeof event !== 'object') return null;
+
+    const type = normalizeAnnouncementType(event.type || event.event_type);
+    const element = event.element && typeof event.element === 'object'
+        ? {
+            label: event.element.label || event.label || '',
+            id: event.element.id || event.element.identifier || '',
+        }
+        : {
+            label: event.label || '',
+            id: event.id || event.identifier || '',
+        };
+
+    return {
+        ...event,
+        type,
+        event_type: type,
+        text: event.text || '',
+        screen: event.screen || '',
+        element,
+        source: event.source || 'voiceover',
+        sessionId: event.sessionId || event.session_id || '',
+        flowId: event.flowId || '',
+    };
+}
+
+function shortId(value) {
+    const text = String(value || '');
+    if (!text) return '';
+    return text.length > 8 ? text.slice(-8) : text;
 }
 
 function updateAnnouncementCount(filteredCount) {

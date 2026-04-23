@@ -300,7 +300,25 @@ accesstive announcements --device <UDID>
 
 # Limit capture to a validation window (seconds)
 accesstive announcements --device booted --duration 15
+
+# Validate one expected utterance during capture
+accesstive announcements --device booted --expected-text "Settings"
 ```
+
+Announcement events are normalized to this shape:
+
+```json
+{
+  "timestamp": "2026-04-21T12:34:56Z",
+  "type": "screen_change",
+  "text": "Settings",
+  "screen": "Settings",
+  "element": { "label": "Settings", "id": "..." },
+  "source": "voiceover"
+}
+```
+
+When `--expected-text` is supplied, the CLI also emits a `validation` object with `expectedText`, `actualText`, `matches`, and `status`.
 
 ---
 
@@ -328,7 +346,7 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 | **Navigate** | Connect to a physical device and navigate elements interactively using on-screen buttons or keyboard shortcuts |
 | **Watch**    | Start real-time monitoring and see accessibility tree changes streamed live                                    |
 | **Focus Logs** | Live stream of focus events (timestamp, label, traits, bounds) with rolling 200-event history             |
-| **Announcements** | Live stream of announcement events with filters (All / Alerts / Screen Changes) and JSON export       |
+| **Announcements** | Live stream of announcement events with type filters, search, JSON export, and validation badges        |
 
 **Keyboard shortcuts in Navigate tab:**
 
@@ -363,7 +381,7 @@ Connect to `ws://localhost:3000` for real-time features:
 | `watch:stop`          | —                         | Stop monitoring                        |
 | `focus:get`           | —                         | Request current rolling focus history  |
 | `focus:clear`         | —                         | Clear rolling focus history            |
-| `announcements:start` | `{ device?, bundleId? }`  | Start announcement stream              |
+| `announcements:start` | `{ device?, bundleId?, expectedText? }` | Start announcement stream              |
 | `announcements:stop`  | —                         | Stop announcement stream               |
 | `announcements:get`   | —                         | Request rolling announcement history   |
 | `announcements:clear` | —                         | Clear rolling announcement history     |
@@ -447,7 +465,7 @@ npm --prefix web start
 ACCESSTIVE_DEVICE=<UDID> npm --prefix web run test:announcements
 ```
 
-On the device, enable VoiceOver and navigate through alert/screen-change flows. Confirm typed events appear in the Announcements tab and exported JSON contains `timestamp`, `event_type`, and `text`.
+On the device, enable VoiceOver and navigate through alert/screen-change flows. Confirm typed events appear in the Announcements tab and exported JSON contains `timestamp`, `type`, `text`, `screen`, `element`, and `source`. If validation is enabled, mismatches are shown inline and preserved in the download.
 
 ---
 

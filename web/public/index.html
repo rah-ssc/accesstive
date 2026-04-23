@@ -148,12 +148,15 @@
                     <select id="announcementFilter" title="Filter announcement event type">
                         <option value="all">All</option>
                         <option value="alert">Alerts</option>
+                        <option value="dynamic_update">Dynamic Updates</option>
+                        <option value="focus_change">Focus Changes</option>
                         <option value="screen_change">Screen Changes</option>
                     </select>
+                    <input type="search" id="announcementSearch" placeholder="Search announcements">
                     <span id="announcementCount" class="stats-inline">0 events</span>
                     <button id="announcementStart" class="btn btn-primary">Start Capture</button>
                     <button id="announcementStop" class="btn btn-danger hidden">Stop</button>
-                    <button id="announcementExport" class="btn btn-sm">Export JSON</button>
+                    <button id="announcementExport" class="btn btn-sm">Download JSON</button>
                     <button id="announcementClear" class="btn btn-sm">Clear</button>
                 </div>
             </div>

@@ -15,19 +15,23 @@ struct Announcements: AsyncParsableCommand {
     @Option(name: .long, help: "Optional duration in seconds; without this, the stream runs until interrupted.")
     var duration: Double?
 
+    @Option(name: .long, help: "Optional expected announcement text for validation.")
+    var expectedText: String?
+
     func run() async throws {
         let connector = try DeviceConnector(deviceId: device)
         let session = try await connector.connect()
+        let announcementFilter = AnnouncementEventFilter()
 
         if session.device.isSimulator {
-            try await streamFromSimulator(session: session)
+            try await streamFromSimulator(session: session, filter: announcementFilter)
             return
         }
 
-        try await streamFromPhysicalDevice(udid: session.device.udid)
+        try await streamFromPhysicalDevice(udid: session.device.udid, filter: announcementFilter)
     }
 
-    private func streamFromSimulator(session: DeviceConnector.Session) async throws {
+    private func streamFromSimulator(session: DeviceConnector.Session, filter: AnnouncementEventFilter) async throws {
         let process = Process()
         let stdout = Pipe()
 
@@ -81,14 +85,28 @@ struct Announcements: AsyncParsableCommand {
                 }
 
                 let timestamp = (json["timestamp"] as? String) ?? ISO8601DateFormatter().string(from: Date())
+                let type = classifyEventType(name: "simulator-log", text: message)
+                let screen = inferScreenName(from: json, bundleId: bundleId)
+                let elementLabel = inferElementLabel(from: json, fallbackText: message)
+                let elementIdentifier = inferElementIdentifier(from: json, bundleId: bundleId)
 
-                let event: [String: Any] = [
-                    "timestamp": timestamp,
-                    "event_type": classifyEventType(name: "simulator-log", text: message),
-                    "text": message,
-                    "source": "simulator",
-                    "raw_event_name": "simulator-log",
-                ]
+                guard let event = buildAnnouncementEvent(
+                    timestamp: timestamp,
+                    type: type,
+                    text: message,
+                    screen: screen,
+                    elementLabel: elementLabel,
+                    elementIdentifier: elementIdentifier,
+                    source: "voiceover",
+                    expectedText: expectedText,
+                    rawEventName: "simulator-log"
+                ) else {
+                    continue
+                }
+
+                guard filter.shouldEmit(event) else {
+                    continue
+                }
 
                 emitJsonLine(event)
             }
@@ -100,7 +118,7 @@ struct Announcements: AsyncParsableCommand {
         }
     }
 
-    private func streamFromPhysicalDevice(udid: String) async throws {
+    private func streamFromPhysicalDevice(udid: String, filter: AnnouncementEventFilter) async throws {
         let bridge = AnnouncementBridge(udid: udid)
         defer { bridge.stop() }
 
@@ -130,13 +148,21 @@ struct Announcements: AsyncParsableCommand {
             if line["type"] as? String == "announcement:event",
                 let event = line["event"] as? [String: Any]
             {
-                emitJsonLine(event)
+                guard let normalized = normalizeAnnouncementEvent(event) else {
+                    continue
+                }
+
+                guard filter.shouldEmit(normalized) else {
+                    continue
+                }
+
+                emitJsonLine(normalized)
             }
         }
     }
 
     private func makeSimulatorPredicate(bundleId: String?) -> String {
-        let base = "eventMessage != '' AND (subsystem CONTAINS[c] 'accessibility' OR category CONTAINS[c] 'Accessibility' OR process CONTAINS[c] 'SpringBoard' OR process CONTAINS[c] 'backboardd' OR eventMessage CONTAINS[c] 'VoiceOver' OR eventMessage CONTAINS[c] 'UIAccessibility' OR eventMessage CONTAINS[c] 'announcement' OR eventMessage CONTAINS[c] 'screen changed' OR eventMessage CONTAINS[c] 'layout changed' OR eventMessage CONTAINS[c] 'focused' OR eventMessage CONTAINS[c] 'selected' OR eventMessage CONTAINS[c] 'activate' OR eventMessage CONTAINS[c] 'alert')"
+        let base = "eventMessage != '' AND (subsystem CONTAINS[c] 'accessibility' OR category CONTAINS[c] 'Accessibility' OR process CONTAINS[c] 'SpringBoard' OR process CONTAINS[c] 'backboardd' OR eventMessage CONTAINS[c] 'VoiceOver' OR eventMessage CONTAINS[c] 'UIAccessibility' OR eventMessage CONTAINS[c] 'announcement' OR eventMessage CONTAINS[c] 'screen changed' OR eventMessage CONTAINS[c] 'layout changed' OR eventMessage CONTAINS[c] 'focused' OR eventMessage CONTAINS[c] 'selected' OR eventMessage CONTAINS[c] 'activate' OR eventMessage CONTAINS[c] 'alert' OR eventMessage CONTAINS[c] 'updated' OR eventMessage CONTAINS[c] 'value changed')"
 
         guard let bundleId, !bundleId.isEmpty else {
             return base
@@ -158,9 +184,8 @@ struct Announcements: AsyncParsableCommand {
             "focus",
             "selected",
             "activate",
-            "button",
-            "tab",
-            "cell",
+            "updated",
+            "value changed",
         ]
 
         return tokens.contains { value.contains($0) }
@@ -168,13 +193,202 @@ struct Announcements: AsyncParsableCommand {
 
     private func classifyEventType(name: String, text: String) -> String {
         let value = "\(name) \(text)".lowercased()
+        if value.contains("focus") || value.contains("currentelementchanged") {
+            return "focus_change"
+        }
         if value.contains("alert") {
             return "alert"
         }
-        if value.contains("screen") || value.contains("layout") {
+        if value.contains("screen changed") || value.contains("layout changed") || (value.contains("screen") && value.contains("changed")) {
             return "screen_change"
         }
-        return "announcement"
+        return "dynamic_update"
+    }
+
+    private func normalizeAnnouncementEvent(_ event: [String: Any]) -> [String: Any]? {
+        let timestamp = (event["timestamp"] as? String) ?? ISO8601DateFormatter().string(from: Date())
+        let type = normalizeAnnouncementType(event["type"] as? String ?? event["event_type"] as? String)
+        let text = (event["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else {
+            return nil
+        }
+
+        let screen = (event["screen"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let element = normalizedElement(from: event, fallbackText: text)
+        let source = (event["source"] as? String)?.isEmpty == false ? (event["source"] as? String ?? "voiceover") : "voiceover"
+
+        return buildAnnouncementEvent(
+            timestamp: timestamp,
+            type: type,
+            text: text,
+            screen: screen,
+            elementLabel: element["label"] as? String,
+            elementIdentifier: element["id"] as? String,
+            source: source,
+            expectedText: (event["expectedText"] as? String) ?? expectedText,
+            rawEventName: event["raw_event_name"] as? String,
+            validation: event["validation"] as? [String: Any]
+        )
+    }
+
+    private func normalizeAnnouncementType(_ type: String?) -> String {
+        switch type?.lowercased() {
+        case "alert":
+            return "alert"
+        case "screen_change":
+            return "screen_change"
+        case "focus_change":
+            return "focus_change"
+        case "dynamic_update":
+            return "dynamic_update"
+        default:
+            return "dynamic_update"
+        }
+    }
+
+    private func buildAnnouncementEvent(
+        timestamp: String,
+        type: String,
+        text: String,
+        screen: String,
+        elementLabel: String?,
+        elementIdentifier: String?,
+        source: String,
+        expectedText: String?,
+        rawEventName: String?,
+        validation: [String: Any]? = nil
+    ) -> [String: Any]? {
+        let element = normalizedElement(label: elementLabel, identifier: elementIdentifier)
+        var event: [String: Any] = [
+            "timestamp": timestamp,
+            "type": type,
+            "event_type": type,
+            "text": text,
+            "screen": screen,
+            "element": element,
+            "source": source,
+        ]
+
+        if let expectedText, !expectedText.isEmpty {
+            event["expectedText"] = expectedText
+            event["validation"] = validation ?? validationPayload(expected: expectedText, actual: text)
+        } else if let validation {
+            event["validation"] = validation
+        }
+
+        if let rawEventName {
+            event["raw_event_name"] = rawEventName
+        }
+
+        return event
+    }
+
+    private func validationPayload(expected: String, actual: String) -> [String: Any] {
+        let matches = normalizedText(expected) == normalizedText(actual)
+        return [
+            "expectedText": expected,
+            "actualText": actual,
+            "matches": matches,
+            "status": matches ? "match" : "mismatch",
+        ]
+    }
+
+    private func normalizedText(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func inferScreenName(from json: [String: Any], bundleId: String?) -> String {
+        let candidates = [
+            json["screen"] as? String,
+            json["context"] as? String,
+            json["process"] as? String,
+            bundleId,
+        ]
+
+        for candidate in candidates {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+
+        return ""
+    }
+
+    private func inferElementLabel(from json: [String: Any], fallbackText: String) -> String {
+        let candidates = [
+            json["label"] as? String,
+            json["text"] as? String,
+            fallbackText,
+        ]
+
+        for candidate in candidates {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+
+        return fallbackText
+    }
+
+    private func inferElementIdentifier(from json: [String: Any], bundleId: String?) -> String {
+        let candidates = [
+            json["id"] as? String,
+            json["identifier"] as? String,
+            bundleId,
+            json["process"] as? String,
+        ]
+
+        for candidate in candidates {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+
+        return ""
+    }
+
+    private func normalizedElement(label: String?, identifier: String?) -> [String: Any] {
+        [
+            "label": label ?? "",
+            "id": identifier ?? "",
+        ]
+    }
+
+    private func normalizedElement(from event: [String: Any], fallbackText: String) -> [String: Any] {
+        if let element = event["element"] as? [String: Any] {
+            return normalizedElement(
+                label: element["label"] as? String ?? fallbackText,
+                identifier: element["id"] as? String
+                    ?? element["identifier"] as? String
+                    ?? (event["screen"] as? String)
+            )
+        }
+
+        return normalizedElement(
+            label: (event["label"] as? String) ?? fallbackText,
+            identifier: (event["id"] as? String) ?? (event["identifier"] as? String)
+        )
+    }
+
+    private func isNoise(text: String, type: String) -> Bool {
+        let value = text.lowercased()
+        let genericHints = [
+            "double tap to activate",
+            "double-tap to activate",
+            "swipe up or down",
+            "swipe left or right",
+            "adjustable",
+            "hint",
+            "hints available",
+        ]
+
+        if type == "dynamic_update" || type == "focus_change" {
+            if genericHints.contains(where: { value.contains($0) }) {
+                return true
+            }
+        }
+
+        return false
     }
 
     private func emitJsonLine(_ event: [String: Any]) {
@@ -185,6 +399,66 @@ struct Announcements: AsyncParsableCommand {
             return
         }
         print(line)
+    }
+}
+
+private final class AnnouncementEventFilter {
+    private let minimumDuplicateInterval: TimeInterval = 1.5
+    private var recentEvents: [String: Date] = [:]
+
+    func shouldEmit(_ event: [String: Any]) -> Bool {
+        guard let text = event["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        let type = (event["type"] as? String) ?? (event["event_type"] as? String) ?? "dynamic_update"
+        if isNoise(text: text, type: type) {
+            return false
+        }
+
+        let screen = (event["screen"] as? String) ?? ""
+        let element = event["element"] as? [String: Any] ?? [:]
+        let signature = [
+            type,
+            text.lowercased(),
+            screen.lowercased(),
+            (element["label"] as? String ?? "").lowercased(),
+            (element["id"] as? String ?? "").lowercased(),
+        ].joined(separator: "|")
+
+        let now = Date()
+        if let lastSeen = recentEvents[signature], now.timeIntervalSince(lastSeen) < minimumDuplicateInterval {
+            return false
+        }
+
+        recentEvents[signature] = now
+        prune(now: now)
+        return true
+    }
+
+    private func prune(now: Date) {
+        recentEvents = recentEvents.filter { now.timeIntervalSince($0.value) < 8.0 }
+    }
+
+    private func isNoise(text: String, type: String) -> Bool {
+        let value = text.lowercased()
+        let genericHints = [
+            "double tap to activate",
+            "double-tap to activate",
+            "swipe up or down",
+            "swipe left or right",
+            "adjustable",
+            "hint",
+            "hints available",
+        ]
+
+        if type == "dynamic_update" || type == "focus_change" {
+            if genericHints.contains(where: { value.contains($0) }) {
+                return true
+            }
+        }
+
+        return false
     }
 }
 

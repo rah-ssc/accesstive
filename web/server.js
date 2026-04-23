@@ -18,6 +18,17 @@ const ACCESSTIVE_BIN = path.resolve(__dirname, '..', '.build', 'debug', 'accesst
 const BRIDGE_SCRIPT = path.resolve(__dirname, '..', 'Scripts', 'accesstive-bridge.py');
 const focusEventBuffer = [];
 const announcementEventBuffer = [];
+const announcementState = {
+    sessionId: null,
+    flowId: null,
+    flowIndex: 0,
+    lastScreenKey: '',
+    latestFocus: null,
+    expectedText: null,
+    recentSignatures: new Map(),
+};
+
+startAnnouncementSession();
 
 function pushFocusEvent(event) {
     if (!event || typeof event !== 'object') {
@@ -33,14 +44,203 @@ function serialize(payload) {
     return JSON.stringify(payload);
 }
 
-function pushAnnouncementEvent(event) {
-    if (!event || typeof event !== 'object') {
-        return;
+function getLatestFocusContext() {
+    for (let index = focusEventBuffer.length - 1; index >= 0; index -= 1) {
+        const event = focusEventBuffer[index];
+        if (event && typeof event === 'object') {
+            return {
+                screen: String(event.screen || '').trim(),
+                element: normalizeElement(event.element, { label: event.text || event.label || '' }),
+            };
+        }
     }
-    announcementEventBuffer.push(event);
+
+    return null;
+}
+
+function startAnnouncementSession(expectedText = null) {
+    announcementState.sessionId = `ann-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    announcementState.flowId = null;
+    announcementState.flowIndex = 0;
+    announcementState.lastScreenKey = '';
+    announcementState.latestFocus = getLatestFocusContext();
+    announcementState.expectedText = expectedText || null;
+    announcementState.recentSignatures.clear();
+}
+
+function normalizeAnnouncementType(type) {
+    const value = String(type || '').toLowerCase();
+    if (value === 'alert') return 'alert';
+    if (value === 'screen_change') return 'screen_change';
+    if (value === 'focus_change') return 'focus_change';
+    return 'dynamic_update';
+}
+
+function normalizeElement(element, fallback = {}) {
+    const source = element && typeof element === 'object' ? element : {};
+    return {
+        label: String(source.label || fallback.label || '').trim(),
+        id: String(source.id || source.identifier || fallback.id || '').trim(),
+    };
+}
+
+function normalizeFocusContext(event) {
+    if (!event || typeof event !== 'object') {
+        return null;
+    }
+
+    const element = normalizeElement(event.element, { label: event.label || '' });
+    const screen = String(event.screen || '').trim();
+
+    return {
+        timestamp: event.timestamp || new Date().toISOString(),
+        type: 'focus_change',
+        event_type: 'focus_change',
+        text: String(event.text || event.label || '').trim(),
+        screen,
+        element,
+        source: 'voiceover',
+        traits: Array.isArray(event.traits) ? event.traits : [],
+        bounds: event.bounds || null,
+    };
+}
+
+function buildFlowId(screen, type) {
+    const screenKey = String(screen || '').trim().toLowerCase();
+
+    if (!announcementState.flowId) {
+        announcementState.flowIndex = 1;
+        announcementState.flowId = `${announcementState.sessionId}-flow-${announcementState.flowIndex}`;
+        announcementState.lastScreenKey = screenKey;
+        return announcementState.flowId;
+    }
+
+    if (screenKey && screenKey !== announcementState.lastScreenKey) {
+        announcementState.flowIndex += 1;
+        announcementState.flowId = `${announcementState.sessionId}-flow-${announcementState.flowIndex}`;
+        announcementState.lastScreenKey = screenKey;
+        return announcementState.flowId;
+    }
+
+    if (type === 'screen_change' && !announcementState.lastScreenKey && screenKey) {
+        announcementState.lastScreenKey = screenKey;
+    }
+
+    return announcementState.flowId;
+}
+
+function isNoiseAnnouncement(text, type) {
+    const lowered = String(text || '').toLowerCase();
+    const genericHints = [
+        'double tap to activate',
+        'double-tap to activate',
+        'swipe up or down',
+        'swipe left or right',
+        'adjustable',
+        'hint',
+        'hints available',
+    ];
+
+    if (type === 'dynamic_update' || type === 'focus_change') {
+        return genericHints.some((value) => lowered.includes(value));
+    }
+
+    return false;
+}
+
+function compareAnnouncementText(expectedText, actualText) {
+    const normalize = (value) => String(value || '').trim().toLowerCase();
+    const matches = normalize(expectedText) === normalize(actualText);
+    return {
+        expectedText,
+        actualText,
+        matches,
+        status: matches ? 'match' : 'mismatch',
+    };
+}
+
+function normalizeAnnouncementEvent(event) {
+    if (!event || typeof event !== 'object') {
+        return null;
+    }
+
+    const type = normalizeAnnouncementType(event.type || event.event_type);
+    const text = String(event.text || '').trim();
+    if (!text) {
+        return null;
+    }
+
+    const source = String(event.source || 'voiceover');
+    const screen = String(event.screen || announcementState.latestFocus?.screen || '').trim();
+    const element = normalizeElement(event.element, announcementState.latestFocus?.element || { label: text });
+    const sessionId = String(event.sessionId || event.session_id || announcementState.sessionId || '');
+    const flowId = String(event.flowId || buildFlowId(screen, type) || '');
+    const expectedText = event.expectedText || announcementState.expectedText || null;
+    const validation = event.validation || (expectedText ? compareAnnouncementText(expectedText, text) : null);
+    const rawEventName = event.raw_event_name || event.rawEventName || null;
+    const timestamp = event.timestamp || new Date().toISOString();
+
+    return {
+        timestamp,
+        type,
+        event_type: type,
+        text,
+        screen,
+        element,
+        source,
+        sessionId,
+        flowId,
+        expectedText,
+        validation,
+        raw_event_name: rawEventName,
+    };
+}
+
+function announcementSignature(event) {
+    const element = normalizeElement(event.element);
+    return [
+        event.type,
+        String(event.text || '').toLowerCase(),
+        String(event.screen || '').toLowerCase(),
+        String(element.label || '').toLowerCase(),
+        String(element.id || '').toLowerCase(),
+    ].join('|');
+}
+
+function pruneAnnouncementSignatures(now = Date.now()) {
+    for (const [signature, timestamp] of announcementState.recentSignatures.entries()) {
+        if (now - timestamp > 8000) {
+            announcementState.recentSignatures.delete(signature);
+        }
+    }
+}
+
+function pushAnnouncementEvent(event) {
+    const normalized = normalizeAnnouncementEvent(event);
+    if (!normalized) {
+        return null;
+    }
+
+    if (isNoiseAnnouncement(normalized.text, normalized.type)) {
+        return null;
+    }
+
+    const signature = announcementSignature(normalized);
+    const now = Date.now();
+    const previous = announcementState.recentSignatures.get(signature);
+    if (previous && now - previous < 1500) {
+        return null;
+    }
+
+    announcementState.recentSignatures.set(signature, now);
+    pruneAnnouncementSignatures(now);
+
+    announcementEventBuffer.push(normalized);
     if (announcementEventBuffer.length > MAX_ANNOUNCEMENT_EVENTS) {
         announcementEventBuffer.splice(0, announcementEventBuffer.length - MAX_ANNOUNCEMENT_EVENTS);
     }
+
+    return normalized;
 }
 
 function buildAnnouncementFromFocusEvent(event) {
@@ -48,16 +248,19 @@ function buildAnnouncementFromFocusEvent(event) {
         return null;
     }
 
-    const label = typeof event.label === 'string' ? event.label.trim() : '';
+    const label = typeof event.text === 'string' ? event.text.trim() : typeof event.label === 'string' ? event.label.trim() : '';
     if (!label) {
         return null;
     }
 
     return {
         timestamp: event.timestamp || new Date().toISOString(),
+        type: 'focus_change',
         event_type: 'focus_change',
         text: label,
-        source: 'focus_stream',
+        screen: String(event.screen || '').trim(),
+        element: normalizeElement(event.element, { label }),
+        source: 'voiceover',
         raw_event_name: 'focus:event',
     };
 }
@@ -189,13 +392,20 @@ wss.on('connection', (ws) => {
                     }
 
                     if (parsed.type === 'focus:event') {
-                        pushFocusEvent(parsed.event);
-                        broadcast({ type: 'focus:event', event: parsed.event });
+                        const focusEvent = normalizeFocusContext(parsed.event) || parsed.event;
+                        announcementState.latestFocus = focusEvent ? {
+                            screen: focusEvent.screen || '',
+                            element: focusEvent.element || normalizeElement(focusEvent, { label: focusEvent.label || '' }),
+                        } : null;
+                        pushFocusEvent(focusEvent);
+                        broadcast({ type: 'focus:event', event: focusEvent });
 
-                        const fallbackAnnouncement = buildAnnouncementFromFocusEvent(parsed.event);
+                        const fallbackAnnouncement = buildAnnouncementFromFocusEvent(focusEvent);
                         if (fallbackAnnouncement) {
-                            pushAnnouncementEvent(fallbackAnnouncement);
-                            broadcast({ type: 'announcement:event', event: fallbackAnnouncement });
+                            const normalizedAnnouncement = pushAnnouncementEvent(fallbackAnnouncement);
+                            if (normalizedAnnouncement) {
+                                broadcast({ type: 'announcement:event', event: normalizedAnnouncement });
+                            }
                         }
                         continue;
                     }
@@ -269,11 +479,17 @@ wss.on('connection', (ws) => {
                 announcementProcess = null;
             }
 
+            startAnnouncementSession(msg.expectedText || null);
+
             const device = msg.device || 'booted';
             const args = ['announcements', '--device', device];
 
             if (msg.bundleId) {
                 args.push('--bundle-id', msg.bundleId);
+            }
+
+            if (msg.expectedText) {
+                args.push('--expected-text', msg.expectedText);
             }
 
             announcementProcess = spawn(ACCESSTIVE_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -302,8 +518,10 @@ wss.on('connection', (ws) => {
                         continue;
                     }
 
-                    pushAnnouncementEvent(event);
-                    broadcast({ type: 'announcement:event', event });
+                    const normalizedEvent = pushAnnouncementEvent(event);
+                    if (normalizedEvent) {
+                        broadcast({ type: 'announcement:event', event: normalizedEvent });
+                    }
                 }
             });
 
@@ -336,6 +554,7 @@ wss.on('connection', (ws) => {
             safeSend(ws, { type: 'announcement:history', events: announcementEventBuffer });
         } else if (type === 'announcements:clear') {
             announcementEventBuffer.length = 0;
+            startAnnouncementSession(announcementState.expectedText);
             broadcast({ type: 'announcement:cleared' });
         } else if (type === 'focus:clear') {
             focusEventBuffer.length = 0;

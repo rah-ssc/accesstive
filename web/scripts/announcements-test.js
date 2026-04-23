@@ -6,6 +6,7 @@ const serverUrl = process.env.ACCESSTIVE_WS_URL || 'ws://localhost:3000';
 const udid = process.env.ACCESSTIVE_DEVICE || process.argv[2] || 'booted';
 const timeoutMs = Number(process.env.ACCESSTIVE_ANNOUNCE_TIMEOUT_MS || 15000);
 const allowEmpty = process.env.ACCESSTIVE_ALLOW_EMPTY === '1';
+const expectedText = process.env.ACCESSTIVE_EXPECTED_TEXT || '';
 
 let socket;
 let started = false;
@@ -59,10 +60,28 @@ socket.on('message', (raw) => {
 
     if (msg.type === 'announcement:event' && msg.event) {
         received += 1;
-        console.log(`[announcements-test] event #${received}: ${msg.event.event_type || 'announcement'} :: ${msg.event.text || ''}`);
+        console.log(`[announcements-test] event #${received}: ${msg.event.type || msg.event.event_type || 'announcement'} :: ${msg.event.text || ''}`);
 
         if (!started) {
             fail('received announcement event before stream started');
+        }
+
+        for (const field of ['timestamp', 'type', 'text', 'screen', 'element', 'source']) {
+            if (!(field in msg.event)) {
+                fail(`announcement event is missing required field: ${field}`);
+            }
+        }
+
+        if (expectedText) {
+            const validation = msg.event.validation || {};
+            const actualText = msg.event.text || '';
+            const matches = String(actualText).trim().toLowerCase() === expectedText.trim().toLowerCase();
+            if (validation.expectedText && validation.expectedText !== expectedText) {
+                fail(`validation expectedText mismatch: ${validation.expectedText}`);
+            }
+            if (validation.matches === false || validation.status === 'mismatch' || !matches) {
+                fail(`announcement mismatch: expected "${expectedText}" but received "${actualText}"`);
+            }
         }
 
         // A single valid event is enough for smoke validation.

@@ -38,11 +38,13 @@ class AccessibilityBridge:
         self.udid = None
         self.current_element = None
         self.current_element_bytes = None
+        self.current_screen_name = None
         self.current_actions = []
         self._monitoring_ready = False
         self._announcement_monitor_task = None
         self._announcement_monitor_running = False
         self._last_announcement_signature = None
+        self._announcement_recent_signatures = {}
         self.wda_xctrunner_candidates = [
             "com.facebook.WebDriverAgentRunner.xctrunner",
             "com.pcloudywda.WebDriverAgentRunner.xctrunner",
@@ -54,9 +56,9 @@ class AccessibilityBridge:
             return "focus_change"
         if "alert" in value:
             return "alert"
-        if "screen" in value or "layout" in value:
+        if "screen changed" in value or "layout changed" in value or ("screen" in value and "changed" in value):
             return "screen_change"
-        return "announcement"
+        return "dynamic_update"
 
     def _find_first_text(self, value):
         if value is None:
@@ -97,10 +99,7 @@ class AccessibilityBridge:
     def _build_announcement_event(self, event):
         payload = self._jsonify(getattr(event, "data", None))
         event_name = str(getattr(event, "name", "") or "")
-        text = self._find_first_text(payload)
-
-        if not text:
-            text = event_name
+        text = self._find_first_text(payload) or event_name
 
         if not text:
             return None
@@ -134,13 +133,24 @@ class AccessibilityBridge:
         ):
             return None
 
-        return {
+        event_type = self._classify_announcement_type(event_name, text)
+        screen = self._extract_screen_name(payload) or self.current_screen_name or ""
+        element = self._extract_element_reference(payload, fallback_text=text)
+        if not element.get("label"):
+            element["label"] = text
+
+        announcement = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "event_type": self._classify_announcement_type(event_name, text),
+            "type": event_type,
+            "event_type": event_type,
             "text": text,
-            "source": "device",
+            "screen": screen,
+            "element": element,
+            "source": "voiceover",
             "raw_event_name": event_name,
         }
+
+        return announcement if self._should_emit_announcement(announcement) else None
 
     def _build_focus_announcement_event(self, focus_item, event_name):
         if focus_item is None:
@@ -155,18 +165,23 @@ class AccessibilityBridge:
         if not label:
             return None
 
-        signature = (str(event_name), label)
+        announcement = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": "focus_change",
+            "event_type": "focus_change",
+            "text": label,
+            "screen": self._extract_screen_name(focus_item) or self.current_screen_name or "",
+            "element": self._build_element_reference(focus_item, label),
+            "source": "voiceover",
+            "raw_event_name": str(event_name or "hostInspectorCurrentElementChanged:"),
+        }
+
+        signature = self._announcement_signature(announcement)
         if signature == self._last_announcement_signature:
             return None
         self._last_announcement_signature = signature
 
-        return {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "event_type": "focus_change",
-            "text": label,
-            "source": "device_focus",
-            "raw_event_name": str(event_name or "hostInspectorCurrentElementChanged:"),
-        }
+        return announcement if self._should_emit_announcement(announcement) else None
 
     def _activation_help_hint(self):
         """Return platform-specific guidance for activation fallbacks."""
@@ -341,6 +356,7 @@ class AccessibilityBridge:
         self.current_element_bytes = (
             element_obj.identifier if element_obj is not None else None
         )
+        self.current_screen_name = self._extract_screen_name(current_item)
         self.current_actions = self._extract_actions(current_item)
 
     def _jsonify(self, value):
@@ -451,9 +467,16 @@ class AccessibilityBridge:
             return None
 
         label = getattr(element, "caption", None) or getattr(element, "spoken_description", None) or ""
+        element_ref = self._build_element_reference(element, label)
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "label": str(label),
+            "type": "focus_change",
+            "event_type": "focus_change",
+            "text": str(label),
+            "screen": self._extract_screen_name(element) or "",
+            "element": element_ref,
+            "source": "voiceover",
             "traits": self._extract_traits(element),
             "bounds": self._extract_bounds(element),
         }
@@ -590,6 +613,119 @@ class AccessibilityBridge:
                 result[attr] = str(val) if not isinstance(val, str) else val
         return {"ok": True, "element": result}
 
+    def _extract_screen_name(self, value):
+        if value is None:
+            return ""
+
+        if isinstance(value, dict):
+            for key in ["screen", "context", "window", "title", "application", "bundle", "name"]:
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+            for candidate in value.values():
+                found = self._extract_screen_name(candidate)
+                if found:
+                    return found
+            return ""
+
+        for attr in ["screen_name", "screen", "context_name", "context", "application_name", "bundle_identifier", "bundle_id", "name", "title"]:
+            candidate = getattr(value, attr, None)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+        return ""
+
+    def _extract_element_reference(self, value, fallback_text=""):
+        label = ""
+        identifier = ""
+
+        if isinstance(value, dict):
+            for key in ["caption", "spoken_description", "label", "text", "announcement"]:
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    label = candidate.strip()
+                    break
+            for key in ["estimated_uid", "platform_identifier", "identifier", "id"]:
+                candidate = value.get(key)
+                if candidate is None:
+                    continue
+                if isinstance(candidate, bytes):
+                    candidate = candidate.hex()
+                identifier = str(candidate).strip()
+                if identifier:
+                    break
+        else:
+            for attr in ["caption", "spoken_description", "label", "text"]:
+                candidate = getattr(value, attr, None)
+                if isinstance(candidate, str) and candidate.strip():
+                    label = candidate.strip()
+                    break
+            for attr in ["estimated_uid", "platform_identifier", "identifier", "id"]:
+                candidate = getattr(value, attr, None)
+                if candidate is None:
+                    continue
+                if isinstance(candidate, bytes):
+                    candidate = candidate.hex()
+                identifier = str(candidate).strip()
+                if identifier:
+                    break
+
+        if not label:
+            label = fallback_text.strip()
+
+        return {"label": label, "id": identifier}
+
+    def _build_element_reference(self, value, fallback_text=""):
+        element = self._extract_element_reference(value, fallback_text=fallback_text)
+        if not element.get("label"):
+            element["label"] = fallback_text.strip()
+        return element
+
+    def _announcement_signature(self, event):
+        element = event.get("element") or {}
+        return "|".join([
+            str(event.get("type") or event.get("event_type") or ""),
+            str(event.get("text") or "").lower(),
+            str(event.get("screen") or "").lower(),
+            str(element.get("label") or "").lower(),
+            str(element.get("id") or "").lower(),
+        ])
+
+    def _should_emit_announcement(self, event):
+        text = str(event.get("text") or "").strip()
+        if not text:
+            return False
+
+        type_name = str(event.get("type") or event.get("event_type") or "dynamic_update")
+        lowered = text.lower()
+        noisy = [
+            "double tap to activate",
+            "double-tap to activate",
+            "swipe up or down",
+            "swipe left or right",
+            "adjustable",
+            "hint",
+            "hints available",
+        ]
+        if type_name in {"dynamic_update", "focus_change"} and any(token in lowered for token in noisy):
+            return False
+
+        signature = self._announcement_signature(event)
+        now = datetime.now(timezone.utc)
+        previous = self._announcement_recent_signatures.get(signature)
+        if previous is not None:
+            delta = (now - previous).total_seconds()
+            if delta < 1.5:
+                return False
+
+        self._announcement_recent_signatures[signature] = now
+        cutoff = now.timestamp() - 8.0
+        self._announcement_recent_signatures = {
+            key: seen for key, seen in self._announcement_recent_signatures.items()
+            if seen.timestamp() >= cutoff
+        }
+        return True
+
     async def activate(self):
         """Press/activate the current element."""
         if not self.service:
@@ -719,6 +855,8 @@ class AccessibilityBridge:
         if self._announcement_monitor_task and not self._announcement_monitor_task.done():
             return {"ok": True, "monitoring": "announcements"}
 
+        self._announcement_recent_signatures = {}
+        self._last_announcement_signature = None
         self._announcement_monitor_running = True
         self._announcement_monitor_task = asyncio.create_task(self._monitor_announcements())
         return {"ok": True, "monitoring": "announcements"}
