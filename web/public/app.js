@@ -10,6 +10,8 @@ let announcementFilter = 'all';
 let announcementSearchQuery = '';
 let announcementCapturing = false;
 
+window.getSelectedDevice = () => selectedDevice;
+
 // ---------- DOM ----------
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -32,6 +34,8 @@ document.addEventListener('DOMContentLoaded', () => {
         selectedDevice = e.target.value;
         updateDeviceStatus();
     });
+
+    if (window.setupAppScanFeature) window.setupAppScanFeature();
 });
 
 // ---------- Tabs ----------

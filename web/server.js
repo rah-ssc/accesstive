@@ -281,6 +281,10 @@ function broadcast(payload) {
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
+// App Scan API (modular)
+const appScanRoutes = require('./app-scan/appScanRoutes');
+app.use('/app-scan', appScanRoutes);
+
 // ---------- REST API ----------
 
 // GET /api/devices — list all devices

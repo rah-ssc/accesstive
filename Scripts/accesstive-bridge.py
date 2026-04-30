@@ -19,9 +19,12 @@ Commands:
 
 import asyncio
 import json
+import re
 import subprocess
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.services.accessibilityaudit import (
@@ -613,6 +616,790 @@ class AccessibilityBridge:
                 result[attr] = str(val) if not isinstance(val, str) else val
         return {"ok": True, "element": result}
 
+    def _normalize_role(self, raw_role, caption=""):
+        value = str(raw_role or "").strip().lower()
+        caption_value = str(caption or "").strip().lower()
+
+        role_map = {
+            "button": "AXButton",
+            "btn": "AXButton",
+            "link": "AXLink",
+            "text field": "AXTextField",
+            "textfield": "AXTextField",
+            "text input": "AXTextField",
+            "input": "AXTextField",
+            "image": "AXImage",
+            "icon": "AXImage",
+            "switch": "AXSwitch",
+            "slider": "AXSlider",
+            "checkbox": "AXCheckBox",
+            "radio button": "AXRadioButton",
+            "stepper": "AXStepper",
+            "picker": "AXPicker",
+            "cell": "AXCell",
+            "static text": "AXStaticText",
+            "label": "AXStaticText",
+            "text": "AXStaticText",
+        }
+
+        for key, role in role_map.items():
+            if value == key or value.endswith(key) or key in value:
+                return role
+
+        if caption_value.endswith("button"):
+            return "AXButton"
+        if caption_value.endswith("link"):
+            return "AXLink"
+        if caption_value.endswith("text field") or caption_value.endswith("textfield"):
+            return "AXTextField"
+        if caption_value.endswith("image"):
+            return "AXImage"
+
+        return "Unknown"
+
+    def _caption_parts(self, caption):
+        text = str(caption or "").strip()
+        if not text:
+            return [], "", None
+
+        parts = [part.strip() for part in text.split(",") if part.strip()]
+        if len(parts) >= 3:
+            role = self._normalize_role(parts[-1], caption=text)
+            label = parts[0]
+            value = ", ".join(parts[1:-1])
+            return parts, label, {"role": role, "value": value}
+
+        if len(parts) == 2:
+            role = self._normalize_role(parts[-1], caption=text)
+            label = parts[0]
+            return parts, label, {"role": role, "value": None}
+
+        return parts, parts[0], {"role": self._normalize_role(text, caption=text), "value": None}
+
+    def _extract_role(self, element, caption=""):
+        fields = getattr(element, "_fields", {}) if element is not None else {}
+        candidates = []
+        for key in [
+            "role",
+            "role_name",
+            "roleDescription",
+            "role_description",
+            "AXRole",
+            "AXRoleDescription",
+            "type",
+        ]:
+            candidate = fields.get(key) if isinstance(fields, dict) else None
+            if candidate:
+                candidates.append(candidate)
+            candidate = getattr(element, key, None)
+            if candidate:
+                candidates.append(candidate)
+
+        for candidate in candidates:
+            role = self._normalize_role(candidate, caption=caption)
+            if role != "Unknown":
+                return role
+
+        _, _, parsed = self._caption_parts(caption)
+        if parsed:
+            return parsed["role"]
+
+        return "Unknown"
+
+    def _extract_label_value(self, element, caption=""):
+        caption_text = str(caption or "").strip()
+        _, parsed_label, parsed = self._caption_parts(caption_text)
+        fields = getattr(element, "_fields", {}) if element is not None else {}
+
+        label = ""
+        value = None
+
+        for key in ["caption", "spoken_description", "label", "text", "title", "name"]:
+            candidate = None
+            if isinstance(fields, dict):
+                candidate = fields.get(key)
+            if candidate is None:
+                candidate = getattr(element, key, None)
+            if isinstance(candidate, str) and candidate.strip():
+                label = candidate.strip()
+                break
+
+        if not label:
+            label = parsed_label or caption_text
+
+        for key in ["value", "Value", "AXValue"]:
+            candidate = None
+            if isinstance(fields, dict):
+                candidate = fields.get(key)
+            if candidate is None:
+                candidate = getattr(element, key, None)
+            if candidate is None:
+                continue
+            if isinstance(candidate, bytes):
+                candidate = candidate.hex()
+            candidate_text = str(candidate).strip()
+            if candidate_text:
+                value = candidate_text
+                break
+
+        if value is None and parsed:
+            value = parsed.get("value")
+
+        return label, value
+
+    def _extract_enabled_value(self, element, caption=""):
+        fields = getattr(element, "_fields", {}) if element is not None else {}
+        for key in ["enabled", "isEnabled", "AXEnabled"]:
+            candidate = None
+            if isinstance(fields, dict):
+                candidate = fields.get(key)
+            if candidate is None:
+                candidate = getattr(element, key, None)
+            if isinstance(candidate, bool):
+                return candidate
+            if isinstance(candidate, str):
+                lowered = candidate.strip().lower()
+                if lowered in {"1", "true", "yes", "enabled"}:
+                    return True
+                if lowered in {"0", "false", "no", "disabled"}:
+                    return False
+
+        return "not enabled" not in str(caption or "").lower()
+
+    def _snapshot_visible_element(self, element):
+        caption = str(getattr(element, "caption", None) or "").strip()
+        spoken_description = str(getattr(element, "spoken_description", None) or "").strip()
+        role = self._extract_role(element, caption=caption)
+        label, value = self._extract_label_value(element, caption=caption)
+        hint = spoken_description if spoken_description and spoken_description != caption else ""
+        identifier = self._extract_element_reference(element, fallback_text=caption).get("id", "")
+        return {
+            "role": role,
+            "label": label,
+            "value": value,
+            "hint": hint,
+            "traits": self._extract_traits(element),
+            "frame": self._extract_bounds(element) or {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+            "identifier": identifier,
+            "isEnabled": self._extract_enabled_value(element, caption=caption),
+            "children": [],
+            "caption": caption,
+            "spoken_description": spoken_description,
+        }
+
+    async def _snapshot_visible_elements(self, limit=120):
+        if not self.service:
+            return []
+
+        elements = []
+        async for item in self.service.iter_elements():
+            elements.append(self._snapshot_visible_element(item))
+            if len(elements) >= limit:
+                break
+
+        return elements
+
+    def _issue_payload(self, rule_id, rule_name, severity, message, element, suggestion=None):
+        issue = {
+            "ruleId": rule_id,
+            "ruleName": rule_name,
+            "severity": severity,
+            "message": message,
+            "element": {
+                "role": element.get("role", "Unknown"),
+                "label": element.get("label", ""),
+            },
+        }
+        if suggestion:
+            issue["suggestion"] = suggestion
+        return issue
+
+    def _evaluate_scan_issues(self, node):
+        issues = []
+        interactive_roles = {
+            "AXButton",
+            "AXTextField",
+            "AXTextArea",
+            "AXSlider",
+            "AXSwitch",
+            "AXLink",
+            "AXPopUpButton",
+            "AXComboBox",
+            "AXCheckBox",
+            "AXRadioButton",
+            "AXSegmentedControl",
+            "AXStepper",
+            "AXPicker",
+            "AXCell",
+        }
+
+        hint_roles = {"AXButton", "AXLink", "AXSwitch", "AXSlider"}
+        role_words = {
+            "AXButton": ["button", "btn"],
+            "AXImage": ["image", "icon", "img"],
+            "AXLink": ["link"],
+            "AXTextField": ["text field", "textfield", "input"],
+        }
+
+        def walk(item):
+            role = item.get("role", "Unknown")
+            label = item.get("label") or ""
+            value = item.get("value") or ""
+            hint = item.get("hint") or ""
+            frame = item.get("frame") or {}
+            enabled = item.get("isEnabled", True)
+
+            if role in interactive_roles and not label:
+                issues.append(
+                    self._issue_payload(
+                        "AX-001",
+                        "Missing Accessibility Label",
+                        "error",
+                        f"Interactive element [{role}] has no accessibility label.",
+                        item,
+                        "Add an accessibilityLabel to describe this element's purpose.",
+                    )
+                )
+
+            if role in hint_roles and label and not hint:
+                issues.append(
+                    self._issue_payload(
+                        "AX-002",
+                        "Missing Accessibility Hint",
+                        "hint",
+                        f"[{role}] \"{label}\" has no accessibility hint.",
+                        item,
+                        "Add an accessibilityHint describing what happens when you interact with this element.",
+                    )
+                )
+
+            width = float(frame.get("width") or 0.0)
+            height = float(frame.get("height") or 0.0)
+            if role in {"AXButton", "AXLink", "AXSwitch", "AXSlider", "AXCheckBox", "AXRadioButton", "AXStepper"}:
+                if width > 0 and height > 0 and (width < 44.0 or height < 44.0):
+                    issues.append(
+                        self._issue_payload(
+                            "AX-003",
+                            "Touch Target Too Small",
+                            "warning",
+                            f"[{role}] \"{label}\" has size {int(width)}x{int(height)} pt, below the 44x44 pt minimum.",
+                            item,
+                            "Increase the tappable area to at least 44x44 points for better accessibility.",
+                        )
+                    )
+
+            if not enabled and not hint:
+                issues.append(
+                    self._issue_payload(
+                        "AX-004",
+                        "Disabled Element Without Context",
+                        "warning",
+                        f"[{role}] \"{label}\" is disabled but has no hint explaining why.",
+                        item,
+                        "Add an accessibilityHint that explains why this element is disabled and how to enable it.",
+                    )
+                )
+
+            if role == "AXImage" and not label:
+                issues.append(
+                    self._issue_payload(
+                        "AX-005",
+                        "Image Missing Description",
+                        "error",
+                        "Image element has no accessibility label.",
+                        item,
+                        "Add an accessibilityLabel describing the image, or mark it as decorative with .accessibilityHidden(true).",
+                    )
+                )
+
+            if role == "AXButton" and not label and not value:
+                issues.append(
+                    self._issue_payload(
+                        "AX-006",
+                        "Empty Button",
+                        "error",
+                        "Button has no label or accessible text content.",
+                        item,
+                        "Add an accessibilityLabel to the button, or ensure it contains accessible text.",
+                    )
+                )
+
+            label_lower = str(label).lower()
+            for role_name, words in role_words.items():
+                if role == role_name:
+                    for word in words:
+                        if label_lower.startswith(word) or label_lower.endswith(word):
+                            issues.append(
+                                self._issue_payload(
+                                    "AX-007",
+                                    "Redundant Trait in Label",
+                                    "hint",
+                                    f"[{role}] label \"{label}\" contains the redundant word \"{word}\". VoiceOver already announces the element type.",
+                                    item,
+                                    f"Remove \"{word}\" from the label. VoiceOver automatically announces the element's role.",
+                                )
+                            )
+                            break
+
+            for child in item.get("children", []):
+                walk(child)
+
+        walk(node)
+        return issues
+
+    def _screen_signature(self, screen_name, elements):
+        parts = [str(screen_name or "").strip().lower()]
+        for element in elements[:8]:
+            label = str(element.get("label") or "").strip().lower()
+            role = str(element.get("role") or "").strip().lower()
+            if label or role:
+                parts.append(f"{role}:{label}")
+        return "|".join(parts)
+
+    def _screen_name_from_elements(self, elements, fallback=""):
+        if self.current_screen_name:
+            return self.current_screen_name
+        for element in elements:
+            label = str(element.get("label") or "").strip()
+            if label:
+                return label[:48]
+        return fallback or "Screen"
+
+    def _is_navigation_candidate(self, element):
+        role = str(element.get("role") or "").strip()
+        label = str(element.get("label") or "").strip().lower()
+        if role not in {"AXButton", "AXLink", "AXCell", "AXStaticText"}:
+            return False
+        if not label:
+            return False
+
+        positive = [
+            "login",
+            "sign in",
+            "sign up",
+            "continue",
+            "next",
+            "proceed",
+            "done",
+            "submit",
+            "checkout",
+            "buy",
+            "purchase",
+            "place order",
+            "open",
+            "details",
+            "start",
+            "get started",
+            "allow",
+            "accept",
+            "menu",
+            "cart",
+            "view",
+            "more",
+        ]
+        negative = ["delete", "remove", "reset", "cancel", "close"]
+
+        if any(token in label for token in negative):
+            return False
+        return any(token in label for token in positive)
+
+    async def _capture_screen(self, bundle_id, max_elements=120):
+        elements = await self._snapshot_visible_elements(limit=max_elements)
+        screen_name = self._screen_name_from_elements(elements, fallback=bundle_id or "Screen")
+        root = {
+            "role": "AXApplication",
+            "label": bundle_id or screen_name,
+            "value": None,
+            "hint": None,
+            "traits": [],
+            "frame": {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
+            "identifier": bundle_id or "",
+            "isEnabled": True,
+            "children": elements,
+        }
+        issues = self._evaluate_scan_issues(root)
+        severity_counts = {
+            "error": sum(1 for issue in issues if issue["severity"] == "error"),
+            "warning": sum(1 for issue in issues if issue["severity"] == "warning"),
+            "hint": sum(1 for issue in issues if issue["severity"] == "hint"),
+        }
+        return {
+            "name": screen_name,
+            "signature": self._screen_signature(screen_name, elements),
+            "elements": elements,
+            "issues": issues,
+            "count": len(issues),
+            "severityCounts": severity_counts,
+        }
+
+    def _issue_signature(self, issue):
+        element = issue.get("element") or {}
+        return "|".join([
+            str(issue.get("ruleId") or "").strip().lower(),
+            str(issue.get("severity") or "").strip().lower(),
+            re.sub(r"\s+", " ", str(issue.get("message") or "").strip().lower()),
+            str(element.get("role") or "").strip().lower(),
+            str(element.get("label") or "").strip().lower(),
+        ])
+
+    def _aggregate_flow(self, screens):
+        flow_issues = []
+        issue_groups = {}
+        severity_groups = {"error": [], "warning": [], "hint": []}
+
+        for screen in screens:
+            for issue in screen["issues"]:
+                enriched = dict(issue)
+                enriched["screen"] = screen["name"]
+                flow_issues.append(enriched)
+                severity_groups.setdefault(enriched["severity"], []).append(enriched)
+
+                signature = self._issue_signature(enriched)
+                group = issue_groups.setdefault(
+                    signature,
+                    {
+                        "ruleId": enriched.get("ruleId"),
+                        "ruleName": enriched.get("ruleName"),
+                        "severity": enriched.get("severity"),
+                        "message": enriched.get("message"),
+                        "element": enriched.get("element"),
+                        "count": 0,
+                        "screens": [],
+                    },
+                )
+                group["count"] += 1
+                if screen["name"] not in group["screens"]:
+                    group["screens"].append(screen["name"])
+
+        repeated_issues = [group for group in issue_groups.values() if group["count"] > 1]
+        summary = {
+            "screensScanned": len(screens),
+            "totalIssues": len(flow_issues),
+            "criticalIssues": len(severity_groups.get("error", [])),
+            "severityGroups": {
+                "error": len(severity_groups.get("error", [])),
+                "warning": len(severity_groups.get("warning", [])),
+                "hint": len(severity_groups.get("hint", [])),
+            },
+            "repeatedIssues": len(repeated_issues),
+        }
+
+        report_lines = [
+            "App Scan Flow Report",
+            f"Screens scanned: {summary['screensScanned']}",
+            f"Total issues: {summary['totalIssues']}",
+            f"Critical issues: {summary['criticalIssues']}",
+        ]
+        for screen in screens:
+            report_lines.append(f"- {screen['name']}: {screen['count']} issue(s)")
+        if repeated_issues:
+            report_lines.append("Repeated issues:")
+            for group in repeated_issues:
+                report_lines.append(
+                    f"- {group['ruleId']} x{group['count']} on {', '.join(group['screens'])}"
+                )
+
+        return {
+            "issues": flow_issues,
+            "severityGroups": severity_groups,
+            "repeatedIssues": repeated_issues,
+            "summary": summary,
+            "report": "\n".join(report_lines),
+        }
+
+    def _detect_connected_device(self):
+        try:
+            result = subprocess.run(
+                ["idevice_id", "-l"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                return ""
+            for line in (result.stdout or "").splitlines():
+                candidate = line.strip()
+                if candidate:
+                    return candidate
+        except Exception:
+            return ""
+        return ""
+
+    def _is_simulator_device(self, device_id):
+        try:
+            result = subprocess.run(
+                ["xcrun", "simctl", "list", "devices", "-j"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0 or not result.stdout:
+                return False
+
+            payload = json.loads(result.stdout)
+            devices = payload.get("devices", {})
+            for runtime_devices in devices.values():
+                for entry in runtime_devices:
+                    if entry.get("udid") == device_id:
+                        return True
+        except Exception:
+            return False
+
+        return False
+
+    def _run_swift_audit(self, device_id, bundle_id):
+        repo_root = Path(__file__).resolve().parents[1]
+        release_binary = repo_root / ".build" / "release" / "accesstive"
+
+        commands = []
+        if release_binary.exists():
+            commands.append(
+                [
+                    str(release_binary),
+                    "audit",
+                    "--device",
+                    device_id,
+                    "--bundle-id",
+                    bundle_id,
+                    "--format",
+                    "json",
+                ]
+            )
+
+        commands.append(
+            [
+                "swift",
+                "run",
+                "accesstive",
+                "audit",
+                "--device",
+                device_id,
+                "--bundle-id",
+                bundle_id,
+                "--format",
+                "json",
+            ]
+        )
+
+        last_error = ""
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=str(repo_root),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                stdout = (result.stdout or "").strip()
+                stderr = (result.stderr or "").strip()
+                if result.returncode == 0 and stdout:
+                    try:
+                        return json.loads(stdout)
+                    except Exception:
+                        last_error = "Failed to parse Swift audit output"
+                        continue
+
+                last_error = stderr or stdout or f"Swift audit failed with exit code {result.returncode}"
+            except Exception as exc:
+                last_error = str(exc)
+
+        return {"error": last_error or "Swift audit failed"}
+
+    def _launch_app_if_needed(self, bundle_id, device_id):
+        try:
+            result = subprocess.run(
+                ["xcrun", "simctl", "list", "devices", "-j"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            is_simulator = False
+            if result.returncode == 0 and result.stdout:
+                try:
+                    payload = json.loads(result.stdout)
+                    devices = payload.get("devices", {})
+                    for runtime_devices in devices.values():
+                        for entry in runtime_devices:
+                            if entry.get("udid") == device_id:
+                                is_simulator = True
+                                break
+                        if is_simulator:
+                            break
+                except Exception:
+                    is_simulator = False
+
+            if is_simulator:
+                launch = subprocess.run(
+                    ["xcrun", "simctl", "launch", device_id, bundle_id],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if launch.returncode == 0:
+                    return {"status": "launched", "device": device_id, "kind": "simulator"}
+                return {"status": "failed", "message": (launch.stderr or launch.stdout or "Failed to launch app").strip()}
+
+            launch = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pymobiledevice3",
+                    "developer",
+                    "core-device",
+                    "launch-application",
+                    "--tunnel",
+                    device_id,
+                    "--kill-existing",
+                    bundle_id,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if launch.returncode == 0:
+                return {"status": "launched", "device": device_id, "kind": "physical"}
+            return {"status": "failed", "message": (launch.stderr or launch.stdout or "Failed to launch app").strip()}
+        except Exception as exc:
+            return {"status": "failed", "message": str(exc)}
+
+    async def _advance_to_next_screen(self, seen_signatures):
+        if not self.service:
+            return None
+
+        try:
+            await self.move("first")
+        except Exception:
+            pass
+
+        for _ in range(12):
+            focused = getattr(self, "current_element", None)
+            current_snapshot = self._snapshot_visible_element(focused) if focused is not None else None
+            if current_snapshot and self._is_navigation_candidate(current_snapshot):
+                before_elements = await self._snapshot_visible_elements(limit=24)
+                before_signature = self._screen_signature(self.current_screen_name or "", before_elements)
+                activation = await self.activate()
+                if activation.get("error"):
+                    await self.move("next")
+                    continue
+
+                await self._sync_latest_focus_event(timeout=0.5)
+                after_elements = await self._snapshot_visible_elements(limit=24)
+                after_signature = self._screen_signature(self.current_screen_name or "", after_elements)
+                if after_signature not in seen_signatures and after_signature != before_signature:
+                    return {
+                        "from": before_signature,
+                        "to": after_signature,
+                        "trigger": current_snapshot.get("label") or current_snapshot.get("caption") or "",
+                        "action": "activate",
+                        "note": activation.get("note") or activation.get("warning") or "Activated",
+                    }
+
+            await self.move("next")
+
+        return None
+
+    async def scan_app_flow(self, bundle_id, device_id=None, scan_mode="single-screen", max_screens=5):
+        if not bundle_id:
+            return {"error": "Missing bundleId"}
+
+        scan_mode = str(scan_mode or "single-screen").strip().lower()
+        full_flow = scan_mode in {"full-flow", "full", "flow"}
+        max_screens = max(1, int(max_screens or 5))
+
+        target_device = str(device_id or "").strip()
+        if not target_device:
+            target_device = self._detect_connected_device()
+
+        if not target_device:
+            return {
+                "error": "No connected physical device found for App Scan. Select a connected device and try again."
+            }
+
+        launch_info = self._launch_app_if_needed(bundle_id, target_device)
+
+        if self._is_simulator_device(target_device):
+            audit = self._run_swift_audit(target_device, bundle_id)
+            if audit.get("error"):
+                return {"error": audit["error"]}
+
+            screen_name = audit.get("screen") or bundle_id
+            screen = {
+                "name": screen_name,
+                "signature": self._screen_signature(screen_name, []),
+                "elements": [],
+                "issues": audit.get("issues", []),
+                "count": audit.get("count", len(audit.get("issues", []))),
+                "severityCounts": {
+                    "error": len([issue for issue in audit.get("issues", []) if issue.get("severity") == "error"]),
+                    "warning": len([issue for issue in audit.get("issues", []) if issue.get("severity") == "warning"]),
+                    "hint": len([issue for issue in audit.get("issues", []) if issue.get("severity") == "hint"]),
+                },
+            }
+            flow = self._aggregate_flow([screen])
+            return {
+                "bundleId": bundle_id,
+                "device": target_device,
+                "mode": "full-flow" if full_flow else "single-screen",
+                "screen": screen_name,
+                "issues": screen["issues"] if not full_flow else flow["issues"],
+                "count": len(screen["issues"] if not full_flow else flow["issues"]),
+                "flow": {
+                    **flow,
+                    "screens": [screen],
+                    "transitions": [],
+                    "launch": launch_info,
+                    "navigationSupported": False,
+                    "note": "Full-flow navigation requires a physical device. This run used the simulator fallback.",
+                },
+            }
+
+        await self.connect(target_device)
+
+        screens = []
+        seen_signatures = set()
+        transitions = []
+
+        try:
+            await self.move("first")
+        except Exception:
+            pass
+
+        while len(screens) < max_screens:
+            screen = await self._capture_screen(bundle_id)
+            if screen["signature"] in seen_signatures:
+                break
+            seen_signatures.add(screen["signature"])
+            screens.append(screen)
+
+            if not full_flow or len(screens) >= max_screens:
+                break
+
+            moved = await self._advance_to_next_screen(seen_signatures)
+            if not moved:
+                break
+
+            transitions.append(moved)
+
+        flow = self._aggregate_flow(screens)
+        first_screen = screens[0] if screens else {"name": "Screen", "issues": [], "count": 0}
+        top_level_issues = first_screen["issues"] if not full_flow else flow["issues"]
+
+        return {
+            "bundleId": bundle_id,
+            "device": target_device,
+            "mode": "full-flow" if full_flow else "single-screen",
+            "screen": first_screen["name"],
+            "issues": top_level_issues,
+            "count": len(top_level_issues),
+            "flow": {
+                **flow,
+                "screens": screens,
+                "transitions": transitions,
+                "launch": launch_info,
+            },
+        }
+
     def _extract_screen_name(self, value):
         if value is None:
             return ""
@@ -840,11 +1627,7 @@ class AccessibilityBridge:
         if not self.service:
             return {"error": "Not connected"}
 
-        elements = []
-        async for item in self.service.iter_elements():
-            elements.append(self._format_element(item).get("element", {}))
-            if len(elements) > 200:
-                break
+        elements = await self._snapshot_visible_elements(limit=200)
 
         return {"ok": True, "elements": elements, "count": len(elements)}
 
@@ -1005,5 +1788,32 @@ async def main():
         write_response(result)
 
 
+def list_apps():
+    # TODO: Replace with real simulator query (placeholder)
+    apps = [
+        {"bundleId": "com.example.demo", "name": "Demo App"},
+        {"bundleId": "com.example.todo", "name": "Todo App"}
+    ]
+    print(json.dumps(apps))
+
+async def scan_app(bundle_id, device_id="", scan_mode="single-screen", max_screens=5):
+    bridge = AccessibilityBridge()
+    result = await bridge.scan_app_flow(
+        bundle_id=bundle_id,
+        device_id=device_id,
+        scan_mode=scan_mode,
+        max_screens=max_screens,
+    )
+    print(json.dumps(result))
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if len(sys.argv) > 1 and sys.argv[1] == "list-apps":
+        list_apps()
+    elif len(sys.argv) > 2 and sys.argv[1] == "scan-app":
+        bundle_id = sys.argv[2]
+        device_id = sys.argv[3] if len(sys.argv) > 3 else ""
+        scan_mode = sys.argv[4] if len(sys.argv) > 4 else "single-screen"
+        max_screens = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else 5
+        asyncio.run(scan_app(bundle_id, device_id=device_id, scan_mode=scan_mode, max_screens=max_screens))
+    else:
+        asyncio.run(main())

@@ -31,6 +31,7 @@
         <button class="tab" data-tab="watch">👁 Watch</button>
         <button class="tab" data-tab="focus-logs">🎯 Focus Logs</button>
         <button class="tab" data-tab="announcements">📣 Announcements</button>
+        <button class="tab" data-tab="app-scan">🧪 App Scan</button>
     </nav>
 
     <main>
@@ -165,8 +166,31 @@
                 <p class="placeholder">Start capture to stream VoiceOver/system accessibility announcements.</p>
             </div>
         </section>
+
+        <!-- ===== APP SCAN TAB ===== -->
+        <section id="tab-app-scan" class="tab-content">
+            <div class="panel-header">
+                <h2>App Scan</h2>
+                <div class="controls">
+                    <button id="app-scan-refresh" class="btn btn-sm">Refresh Apps</button>
+                    <select id="app-scan-app-list"></select>
+                    <select id="app-scan-mode">
+                        <option value="single-screen">Single Screen</option>
+                        <option value="full-flow">Full Flow</option>
+                    </select>
+                    <button id="app-scan-run" class="btn btn-primary">Run Scan</button>
+                    <button id="app-scan-export" class="btn btn-sm" disabled>Export JSON</button>
+                </div>
+            </div>
+            <div id="app-scan-results" class="result app-scan-results">
+                <p class="placeholder">Select an app and click Run Scan to check the current screen or the full flow.</p>
+            </div>
+        </section>
     </main>
 
+    <script src="app-scan/appScanTab.js"></script>
+    <script src="app-scan/appScanApi.js"></script>
+    <script src="app-scan/appScanMain.js"></script>
     <script src="app.js"></script>
 </body>
 
